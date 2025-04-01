@@ -21,6 +21,10 @@ struct Args {
     /// Output directory for the generated images
     #[arg(short, long, default_value = ".")]
     output_dir: PathBuf,
+
+    /// Anti-aliasing quality (0 = disabled, 1 = low, 2 = medium, 3 = high)
+    #[arg(short = 'a', long, default_value_t = 2)]
+    aa_quality: u8,
 }
 
 fn main() -> Result<()> {
@@ -60,17 +64,23 @@ fn main() -> Result<()> {
 
     // Initialize renderer
     log::info!(
-        "Initializing renderer with image size {}x{}",
+        "Initializing renderer with image size {}x{} and AA quality {}",
         args.size,
-        args.size
+        args.size,
+        args.aa_quality
     );
-    let renderer = pollster::block_on(renderer::Renderer::new(args.size, args.size))?;
+
+    let renderer = pollster::block_on(renderer::Renderer::new(
+        args.size,
+        args.size,
+        args.aa_quality,
+    ))?;
 
     // Create the cameras for each cube face with appropriate distance
-    let cameras = camera::create_cube_cameras(min_bound, max_bound);
+    let mut cameras = camera::create_cube_cameras(min_bound, max_bound);
 
     // Log camera information for debugging
-    for (i, camera) in cameras.iter().enumerate() {
+    for (i, camera) in cameras.iter_mut().enumerate() {
         let face_name = match i {
             0 => "positive_x",
             1 => "negative_x",
@@ -81,7 +91,15 @@ fn main() -> Result<()> {
             _ => unreachable!(),
         };
 
-        log::info!("Rendering {face_name} face");
+        // Update camera's near and far planes based on the mesh bounds
+        camera.update_depth_for_mesh(min_bound, max_bound);
+
+        log::info!(
+            "Rendering {face_name} face (near: {}, far: {})",
+            camera.near,
+            camera.far
+        );
+
         let image_data = pollster::block_on(renderer.render(&mesh, camera))?;
 
         // Save the image

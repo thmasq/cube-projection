@@ -18,10 +18,11 @@ pub struct Renderer {
     uniform_bind_group_layout: wgpu::BindGroupLayout,
     width: u32,
     height: u32,
+    sample_count: u32,
 }
 
 impl Renderer {
-    pub async fn new(width: u32, height: u32) -> Result<Self> {
+    pub async fn new(width: u32, height: u32, aa_quality: u8) -> Result<Self> {
         // Initialize WGPU
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
@@ -44,6 +45,40 @@ impl Renderer {
                 None,
             )
             .await?;
+
+        // Determine sample count based on quality and adapter capabilities
+        let sample_flags = adapter
+            .get_texture_format_features(wgpu::TextureFormat::Rgba8Unorm)
+            .flags;
+
+        // Map quality level to sample count
+        let requested_samples = match aa_quality {
+            0 => 1, // No AA
+            1 => 2, // Low
+            2 => 4, // Medium (default)
+            _ => 8, // High or any other value
+        };
+
+        // Check adapter support
+        let max_sample_count =
+            if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X8) {
+                8
+            } else if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4) {
+                4
+            } else if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X2) {
+                2
+            } else {
+                1 // No MSAA support
+            };
+
+        // Use requested sample count or the maximum available if lower
+        let sample_count = requested_samples.min(max_sample_count);
+
+        if sample_count > 1 {
+            log::info!("Using MSAA with {} samples", sample_count);
+        } else {
+            log::info!("MSAA disabled");
+        }
 
         // Create bind group layout for uniforms
         let uniform_bind_group_layout =
@@ -120,7 +155,7 @@ impl Renderer {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 1,
+                count: sample_count,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -135,15 +170,31 @@ impl Renderer {
             uniform_bind_group_layout,
             width,
             height,
+            sample_count,
         })
     }
 
     pub async fn render(&self, mesh: &Mesh, camera: &Camera) -> Result<Vec<u8>> {
-        // Create render texture
+        // Create multisampled render texture
         let texture_extent = wgpu::Extent3d {
             width: self.width,
             height: self.height,
             depth_or_array_layers: 1,
+        };
+
+        let multisampled_texture = if self.sample_count > 1 {
+            Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Multisampled Texture"),
+                size: texture_extent,
+                mip_level_count: 1,
+                sample_count: self.sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            }))
+        } else {
+            None
         };
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -159,12 +210,15 @@ impl Renderer {
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Create depth texture
+        let msaa_view = multisampled_texture
+            .as_ref()
+            .map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default()));
+
         let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
             size: texture_extent,
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: self.sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -240,8 +294,12 @@ impl Renderer {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
-                    resolve_target: None,
+                    view: msaa_view.as_ref().unwrap_or(&texture_view),
+                    resolve_target: if self.sample_count > 1 {
+                        Some(&texture_view)
+                    } else {
+                        None
+                    },
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.5, // Light gray for better visibility
