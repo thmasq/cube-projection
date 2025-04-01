@@ -12,9 +12,9 @@ pub struct Vertex {
 }
 
 impl Vertex {
-    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
+    pub const fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 // position
@@ -64,57 +64,54 @@ impl Mesh {
         for model in models {
             let mesh = model.mesh;
 
-            // Process mesh positions, normals, and texture coordinates
-            let positions: Vec<[f32; 3]> = mesh
-                .positions
-                .chunks_exact(3)
-                .map(|p| [p[0], p[1], p[2]])
-                .collect();
+            // Process vertices
+            let positions_count = mesh.positions.len() / 3;
 
-            let normals = if !mesh.normals.is_empty() {
-                mesh.normals
-                    .chunks_exact(3)
-                    .map(|n| [n[0], n[1], n[2]])
-                    .collect::<Vec<[f32; 3]>>()
-            } else {
-                // Generate default normals if none provided
-                positions
-                    .iter()
-                    .map(|_| [0.0, 1.0, 0.0])
-                    .collect::<Vec<[f32; 3]>>()
-            };
+            for i in 0..positions_count {
+                let pos_i = i * 3;
+                let tex_i = i * 2;
 
-            let tex_coords = if !mesh.texcoords.is_empty() {
-                mesh.texcoords
-                    .chunks_exact(2)
-                    .map(|t| [t[0], t[1]])
-                    .collect::<Vec<[f32; 2]>>()
-            } else {
-                // Generate default UVs if none provided
-                positions
-                    .iter()
-                    .map(|_| [0.0, 0.0])
-                    .collect::<Vec<[f32; 2]>>()
-            };
+                // Get position
+                let position = [
+                    mesh.positions[pos_i],
+                    mesh.positions[pos_i + 1],
+                    mesh.positions[pos_i + 2],
+                ];
 
-            // Create vertices
-            for i in 0..positions.len() {
+                // Get or create normal
+                let normal = if pos_i + 2 < mesh.normals.len() {
+                    [
+                        mesh.normals[pos_i],
+                        mesh.normals[pos_i + 1],
+                        mesh.normals[pos_i + 2],
+                    ]
+                } else {
+                    [0.0, 1.0, 0.0] // Default normal
+                };
+
+                // Get or create texture coordinates
+                let tex_coords = if tex_i + 1 < mesh.texcoords.len() {
+                    [mesh.texcoords[tex_i], mesh.texcoords[tex_i + 1]]
+                } else {
+                    [0.0, 0.0] // Default texture coordinates
+                };
+
                 vertices.push(Vertex {
-                    position: positions[i],
-                    normal: normals[i],
-                    tex_coords: tex_coords[i],
+                    position,
+                    normal,
+                    tex_coords,
                 });
             }
 
             // Add indices
-            for index in mesh.indices {
-                indices.push(index as u32 + index_offset);
+            for index in &mesh.indices {
+                indices.push({ *index } + index_offset);
             }
 
-            index_offset = vertices.len() as u32;
+            index_offset = u32::try_from(vertices.len()).unwrap();
         }
 
-        // Generate vertex normals if not present or we need to recalculate them
+        // Generate vertex normals if not present
         if vertices.iter().all(|v| v.normal == [0.0, 1.0, 0.0]) {
             Self::compute_normals(&mut vertices, &indices);
         }
@@ -122,7 +119,22 @@ impl Mesh {
         Ok(Self { vertices, indices })
     }
 
-    // Compute normals based on face adjacency
+    pub fn calculate_bounding_box(&self) -> (glam::Vec3, glam::Vec3) {
+        // Initialize with extreme values
+        let mut min = glam::Vec3::new(f32::MAX, f32::MAX, f32::MAX);
+        let mut max = glam::Vec3::new(f32::MIN, f32::MIN, f32::MIN);
+
+        // Find min and max points
+        for vertex in &self.vertices {
+            let pos = glam::Vec3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
+
+            min = min.min(pos);
+            max = max.max(pos);
+        }
+
+        (min, max)
+    }
+
     fn compute_normals(vertices: &mut [Vertex], indices: &[u32]) {
         // Reset all normals
         for vertex in vertices.iter_mut() {

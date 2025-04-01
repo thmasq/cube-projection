@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     }
 
     // Load the mesh
-    log::info!("Loading mesh from {:?}", args.input);
+    log::info!("Loading mesh from {}", args.input.display());
     let mesh = mesh::Mesh::load(&args.input)?;
     log::info!(
         "Loaded mesh with {} vertices and {} indices",
@@ -52,18 +52,24 @@ fn main() -> Result<()> {
         mesh.indices.len()
     );
 
+    // Calculate bounding box for proper camera positioning
+    let (min_bound, max_bound) = mesh.calculate_bounding_box();
+    log::info!("Mesh bounds: min={min_bound:?}, max={max_bound:?}");
+    log::info!("Mesh dimensions: {:?}", max_bound - min_bound);
+    log::info!("Mesh center: {:?}", (min_bound + max_bound) * 0.5);
+
     // Initialize renderer
     log::info!(
         "Initializing renderer with image size {}x{}",
         args.size,
         args.size
     );
-    let mut renderer = pollster::block_on(renderer::Renderer::new(args.size, args.size))?;
+    let renderer = pollster::block_on(renderer::Renderer::new(args.size, args.size))?;
 
-    // Create the cameras for each cube face
-    let cameras = camera::create_cube_cameras();
+    // Create the cameras for each cube face with appropriate distance
+    let cameras = camera::create_cube_cameras(min_bound, max_bound);
 
-    // Render each cube face and save the images
+    // Log camera information for debugging
     for (i, camera) in cameras.iter().enumerate() {
         let face_name = match i {
             0 => "positive_x",
@@ -75,12 +81,12 @@ fn main() -> Result<()> {
             _ => unreachable!(),
         };
 
-        log::info!("Rendering {} face", face_name);
+        log::info!("Rendering {face_name} face");
         let image_data = pollster::block_on(renderer.render(&mesh, camera))?;
 
         // Save the image
-        let output_path = args.output_dir.join(format!("face_{}.png", face_name));
-        log::info!("Saving image to {:?}", output_path);
+        let output_path = args.output_dir.join(format!("face_{face_name}.png"));
+        log::info!("Saving image to {}", output_path.display());
         utils::save_image(&image_data, args.size, args.size, &output_path)?;
     }
 

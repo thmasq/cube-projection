@@ -221,7 +221,7 @@ impl Renderer {
         });
 
         // Create output buffer to copy the rendered texture
-        let output_buffer_size = (self.width * self.height * 4) as wgpu::BufferAddress;
+        let output_buffer_size = wgpu::BufferAddress::from(self.width * self.height * 4);
         let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Buffer"),
             size: output_buffer_size,
@@ -244,9 +244,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
+                            r: 0.5, // Light gray for better visibility
+                            g: 0.5,
+                            b: 0.5,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -268,7 +268,7 @@ impl Renderer {
             render_pass.set_bind_group(0, &uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+            render_pass.draw_indexed(0..u32::try_from(mesh.indices.len()).unwrap(), 0, 0..1);
         }
 
         // Copy the texture to the output buffer
