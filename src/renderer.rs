@@ -14,7 +14,6 @@ struct Uniforms {
     model: [[f32; 4]; 4],
 }
 
-#[allow(dead_code)]
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -25,6 +24,7 @@ pub struct Renderer {
     width: u32,
     height: u32,
     sample_count: u32,
+    background_color: wgpu::Color,
 }
 
 impl Renderer {
@@ -33,6 +33,7 @@ impl Renderer {
         height: u32,
         aa_quality: u8,
         texture_path: Option<&Path>,
+        background_color: Option<wgpu::Color>,
     ) -> Result<Self> {
         // Initialize WGPU
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -225,6 +226,13 @@ impl Renderer {
             cache: None,
         });
 
+        let background_color = background_color.unwrap_or(wgpu::Color {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+            a: 1.0,
+        });
+
         Ok(Self {
             device,
             queue,
@@ -235,6 +243,7 @@ impl Renderer {
             width,
             height,
             sample_count,
+            background_color,
         })
     }
 
@@ -365,12 +374,7 @@ impl Renderer {
                         None
                     },
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.5, // Light gray for better visibility
-                            g: 0.5,
-                            b: 0.5,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.background_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

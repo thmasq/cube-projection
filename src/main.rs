@@ -30,6 +30,11 @@ struct Args {
     /// Path to texture file (optional, but lack thereof will result in plain white model, with no lighting)
     #[arg(short = 't', long)]
     texture: Option<PathBuf>,
+
+    /// Background color in hex format (RGB, RGBA, RRGGBB, or RRGGBBAA)
+    /// Example: "FF0000" for red, "00FF00FF" for opaque green, "00000000" for transparent
+    #[arg(short = 'b', long)]
+    bg_color: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -85,12 +90,35 @@ fn main() -> Result<()> {
         args.aa_quality
     );
 
+    let bg_color = if let Some(hex) = &args.bg_color {
+        match utils::parse_hex_color(hex) {
+            Ok(color) => {
+                log::info!(
+                    "Using custom background color: rgba({:.2}, {:.2}, {:.2}, {:.2})",
+                    color.r,
+                    color.g,
+                    color.b,
+                    color.a
+                );
+                Some(color)
+            }
+            Err(e) => {
+                log::warn!("Failed to parse background color: {}", e);
+                log::warn!("Using default background color");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Create renderer with texture if provided
     let renderer = pollster::block_on(renderer::Renderer::new(
         args.size,
         args.size,
         args.aa_quality,
         args.texture.as_deref(),
+        bg_color,
     ))?;
 
     // Create the cameras for each cube face with appropriate distance
