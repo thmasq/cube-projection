@@ -1,10 +1,11 @@
-use std::path::Path;
-
 use crate::camera::Camera;
 use crate::mesh::{Mesh, Vertex};
 use crate::texture::Texture;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -14,6 +15,7 @@ struct Uniforms {
     model: [[f32; 4]; 4],
 }
 
+#[allow(dead_code)]
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -247,60 +249,12 @@ impl Renderer {
         })
     }
 
-    pub async fn render(&self, mesh: &Mesh, camera: &Camera) -> Result<Vec<u8>> {
-        // Create multisampled render texture
-        let texture_extent = wgpu::Extent3d {
-            width: self.width,
-            height: self.height,
-            depth_or_array_layers: 1,
-        };
-
-        let multisampled_texture = if self.sample_count > 1 {
-            Some(self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Multisampled Texture"),
-                size: texture_extent,
-                mip_level_count: 1,
-                sample_count: self.sample_count,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            }))
-        } else {
-            None
-        };
-
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Render Texture"),
-            size: texture_extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let msaa_view = multisampled_texture
-            .as_ref()
-            .map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default()));
-
-        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Depth Texture"),
-            size: texture_extent,
-            mip_level_count: 1,
-            sample_count: self.sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Create vertex buffer
+    pub async fn render_cube_faces(
+        &self,
+        mesh: &Mesh,
+        cameras: &[Camera; 6],
+    ) -> Result<Vec<Vec<u8>>> {
+        // Prepare GPU resources once for all renders
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -309,7 +263,6 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
-        // Create index buffer
         let index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -318,10 +271,220 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        // Create uniform buffer with camera and model matrices
-        let view_proj = camera.get_view_proj_matrix();
+        // Create output buffer for each face
+        let output_buffer_size = self.width as u64 * self.height as u64 * 4;
+        let output_buffers: Vec<_> = (0..6)
+            .map(|i| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("Output Buffer {}", i)),
+                    size: output_buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
 
-        // Identity matrix for the model transform - can be changed for more complex scenarios
+        // Create shared buffer to collect results
+        let results = Arc::new(Mutex::new(vec![Vec::new(); 6]));
+
+        // Create a single CommandEncoder
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Batch Render Encoder"),
+            });
+
+        // Prepare texture extent once for all faces
+        let texture_extent = wgpu::Extent3d {
+            width: self.width,
+            height: self.height,
+            depth_or_array_layers: 1,
+        };
+
+        // Create textures for all faces
+        let (render_textures, msaa_textures, depth_textures) = self.create_face_textures(6);
+
+        // Submit all render passes first
+        for (i, camera) in cameras.iter().enumerate() {
+            // Use the same encoder for all render passes
+            let uniform_bind_group = self.create_uniform_bind_group(camera);
+
+            let texture_view =
+                render_textures[i].create_view(&wgpu::TextureViewDescriptor::default());
+            let msaa_view = msaa_textures
+                .get(i)
+                .map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            let depth_view = depth_textures[i].create_view(&wgpu::TextureViewDescriptor::default());
+
+            // Record render pass
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(&format!("Render Pass {}", i)),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: msaa_view.as_ref().unwrap_or(&texture_view),
+                        resolve_target: if self.sample_count > 1 {
+                            Some(&texture_view)
+                        } else {
+                            None
+                        },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(self.background_color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+
+                render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_bind_group(0, &uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..u32::try_from(mesh.indices.len()).unwrap(), 0, 0..1);
+            }
+
+            // Record copy texture to buffer
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &render_textures[i],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &output_buffers[i],
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(self.width * 4),
+                        rows_per_image: Some(self.height),
+                    },
+                },
+                texture_extent,
+            );
+        }
+
+        // Submit all commands at once to allow the GPU to batch operations
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Use multiple threads to handle buffer readback in parallel
+        let mut handles = vec![];
+
+        for (i, buffer) in output_buffers.iter().enumerate() {
+            let buffer_clone = buffer.clone();
+            let results_clone = Arc::clone(&results);
+            let device_clone = self.device.clone();
+
+            let handle = thread::spawn(move || {
+                let buffer_slice = buffer_clone.slice(..);
+
+                // Map the buffer asynchronously
+                let (tx, rx) = std::sync::mpsc::channel();
+                buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+
+                // Wait for the mapping to complete
+                device_clone.poll(wgpu::Maintain::Wait);
+                rx.recv().unwrap().expect("Failed to map buffer");
+
+                // Get the buffer data
+                let data = buffer_slice.get_mapped_range();
+                let face_data = data.to_vec();
+                drop(data);
+                buffer_clone.unmap();
+
+                // Store the result
+                let mut results = results_clone.lock().unwrap();
+                results[i] = face_data;
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Return the results
+        Ok(Arc::try_unwrap(results).unwrap().into_inner().unwrap())
+    }
+
+    // Create textures for multiple faces at once
+    fn create_face_textures(
+        &self,
+        count: usize,
+    ) -> (Vec<wgpu::Texture>, Vec<wgpu::Texture>, Vec<wgpu::Texture>) {
+        let texture_extent = wgpu::Extent3d {
+            width: self.width,
+            height: self.height,
+            depth_or_array_layers: 1,
+        };
+
+        let render_textures: Vec<_> = (0..count)
+            .map(|i| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("Render Texture {}", i)),
+                    size: texture_extent,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            })
+            .collect();
+
+        let msaa_textures: Vec<_> = if self.sample_count > 1 {
+            (0..count)
+                .map(|i| {
+                    self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(&format!("Multisampled Texture {}", i)),
+                        size: texture_extent,
+                        mip_level_count: 1,
+                        sample_count: self.sample_count,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let depth_textures: Vec<_> = (0..count)
+            .map(|i| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("Depth Texture {}", i)),
+                    size: texture_extent,
+                    mip_level_count: 1,
+                    sample_count: self.sample_count,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            })
+            .collect();
+
+        (render_textures, msaa_textures, depth_textures)
+    }
+
+    // Helper method to create a uniform bind group for a camera
+    fn create_uniform_bind_group(&self, camera: &Camera) -> wgpu::BindGroup {
+        let view_proj = camera.get_view_proj_matrix();
         let model = glam::Mat4::IDENTITY;
 
         let uniforms = Uniforms {
@@ -337,105 +500,13 @@ impl Renderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        // Create bind group for uniforms
-        let uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Uniform Bind Group"),
             layout: &self.uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
             }],
-        });
-
-        // Create output buffer to copy the rendered texture
-        let output_buffer_size = wgpu::BufferAddress::from(self.width * self.height * 4);
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer"),
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        // Start rendering
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: msaa_view.as_ref().unwrap_or(&texture_view),
-                    resolve_target: if self.sample_count > 1 {
-                        Some(&texture_view)
-                    } else {
-                        None
-                    },
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.background_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &uniform_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..u32::try_from(mesh.indices.len()).unwrap(), 0, 0..1);
-        }
-
-        // Copy the texture to the output buffer
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &output_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.width * 4),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            texture_extent,
-        );
-
-        // Submit the command buffer and await completion
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        // Read the output buffer
-        let buffer_slice = output_buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-
-        rx.recv().unwrap()?;
-
-        // Get the buffer data
-        let data = buffer_slice.get_mapped_range();
-        let result = data.to_vec();
-        drop(data);
-        output_buffer.unmap();
-
-        Ok(result)
+        })
     }
 }

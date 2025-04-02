@@ -7,6 +7,7 @@ mod utils;
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -35,11 +36,18 @@ struct Args {
     /// Example: "FF0000" for red, "00FF00FF" for opaque green, "00000000" for transparent
     #[arg(short = 'b', long)]
     bg_color: Option<String>,
+
+    /// Enable detailed performance metrics
+    #[arg(short = 'm', long, default_value_t = false)]
+    metrics: bool,
 }
 
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+
+    // Start total time measurement
+    let start_total = Instant::now();
 
     // Validate input file
     if !args.input.exists() {
@@ -68,51 +76,42 @@ fn main() -> Result<()> {
     }
 
     // Load the mesh
+    let mesh_start = Instant::now();
     log::info!("Loading mesh from {}", args.input.display());
     let mesh = mesh::Mesh::load(&args.input)?;
-    log::info!(
-        "Loaded mesh with {} vertices and {} indices",
-        mesh.vertices.len(),
-        mesh.indices.len()
-    );
+    if args.metrics {
+        log::info!("Mesh loading: {:.2?}", mesh_start.elapsed());
+    }
 
     // Calculate bounding box for proper camera positioning
+    let bounds_start = Instant::now();
     let (min_bound, max_bound) = mesh.calculate_bounding_box();
-    log::info!("Mesh bounds: min={min_bound:?}, max={max_bound:?}");
-    log::info!("Mesh dimensions: {:?}", max_bound - min_bound);
-    log::info!("Mesh center: {:?}", (min_bound + max_bound) * 0.5);
+    if args.metrics {
+        log::info!("Bounding box calculation: {:.2?}", bounds_start.elapsed());
+    }
 
-    // Initialize renderer
-    log::info!(
-        "Initializing renderer with image size {}x{} and AA quality {}",
-        args.size,
-        args.size,
-        args.aa_quality
-    );
-
-    let bg_color = if let Some(hex) = &args.bg_color {
-        match utils::parse_hex_color(hex) {
-            Ok(color) => {
-                log::info!(
-                    "Using custom background color: rgba({:.2}, {:.2}, {:.2}, {:.2})",
-                    color.r,
-                    color.g,
-                    color.b,
-                    color.a
-                );
-                Some(color)
-            }
-            Err(e) => {
-                log::warn!("Failed to parse background color: {}", e);
-                log::warn!("Using default background color");
-                None
-            }
+    // Create the cameras for each cube face with appropriate distance
+    let cameras_start = Instant::now();
+    let mut cameras = camera::create_cube_cameras(min_bound, max_bound);
+    // Update in parallel
+    rayon::scope(|s| {
+        for camera in cameras.iter_mut() {
+            s.spawn(|_| {
+                camera.update_depth_for_mesh(min_bound, max_bound);
+            });
         }
+    });
+    if args.metrics {
+        log::info!("Camera setup: {:.2?}", cameras_start.elapsed());
+    }
+
+    let renderer_start = Instant::now();
+    let bg_color = if let Some(hex) = &args.bg_color {
+        utils::parse_hex_color(hex).ok()
     } else {
         None
     };
 
-    // Create renderer with texture if provided
     let renderer = pollster::block_on(renderer::Renderer::new(
         args.size,
         args.size,
@@ -120,39 +119,44 @@ fn main() -> Result<()> {
         args.texture.as_deref(),
         bg_color,
     ))?;
-
-    // Create the cameras for each cube face with appropriate distance
-    let mut cameras = camera::create_cube_cameras(min_bound, max_bound);
-
-    // Log camera information for debugging
-    for (i, camera) in cameras.iter_mut().enumerate() {
-        let face_name = match i {
-            0 => "positive_x",
-            1 => "negative_x",
-            2 => "positive_y",
-            3 => "negative_y",
-            4 => "positive_z",
-            5 => "negative_z",
-            _ => unreachable!(),
-        };
-
-        // Update camera's near and far planes based on the mesh bounds
-        camera.update_depth_for_mesh(min_bound, max_bound);
-
-        log::info!(
-            "Rendering {face_name} face (near: {}, far: {})",
-            camera.near,
-            camera.far
-        );
-
-        let image_data = pollster::block_on(renderer.render(&mesh, camera))?;
-
-        // Save the image
-        let output_path = args.output_dir.join(format!("face_{face_name}.png"));
-        log::info!("Saving image to {}", output_path.display());
-        utils::save_image(&image_data, args.size, args.size, &output_path)?;
+    if args.metrics {
+        log::info!("Renderer initialization: {:.2?}", renderer_start.elapsed());
     }
 
-    log::info!("Completed cube projection");
+    // Render all faces using our optimized batch renderer
+    let render_start = Instant::now();
+    let face_images = pollster::block_on(renderer.render_cube_faces(&mesh, &cameras))?;
+    if args.metrics {
+        log::info!("Batch rendering: {:.2?}", render_start.elapsed());
+    }
+
+    // Save images in parallel
+    let save_start = Instant::now();
+    rayon::scope(|s| {
+        for (i, image_data) in face_images.into_iter().enumerate() {
+            let face_name = match i {
+                0 => "positive_x",
+                1 => "negative_x",
+                2 => "positive_y",
+                3 => "negative_y",
+                4 => "positive_z",
+                5 => "negative_z",
+                _ => unreachable!(),
+            };
+
+            let output_path = args.output_dir.join(format!("face_{face_name}.png"));
+            let size = args.size;
+
+            s.spawn(move |_| {
+                utils::save_image(&image_data, size, size, &output_path)
+                    .expect("Failed to save image");
+            });
+        }
+    });
+    if args.metrics {
+        log::info!("Image saving: {:.2?}", save_start.elapsed());
+    }
+
+    log::info!("Total execution time: {:.2?}", start_total.elapsed());
     Ok(())
 }
