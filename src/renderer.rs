@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use crate::camera::Camera;
 use crate::mesh::{Mesh, Vertex};
+use crate::texture::Texture;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -11,18 +14,26 @@ struct Uniforms {
     model: [[f32; 4]; 4],
 }
 
+#[allow(dead_code)]
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    texture_bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
     sample_count: u32,
 }
 
 impl Renderer {
-    pub async fn new(width: u32, height: u32, aa_quality: u8) -> Result<Self> {
+    pub async fn new(
+        width: u32,
+        height: u32,
+        aa_quality: u8,
+        texture_path: Option<&Path>,
+    ) -> Result<Self> {
         // Initialize WGPU
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
@@ -96,6 +107,57 @@ impl Renderer {
                 }],
             });
 
+        // Create bind group layout for texture
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Texture Bind Group Layout"),
+                entries: &[
+                    // Texture
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        // Load texture or create default white texture
+        let texture = match texture_path {
+            Some(path) => Texture::load(&device, &queue, path)?,
+            None => {
+                log::info!("No texture provided. Using default white texture.");
+                Texture::create_default(&device, &queue)
+            }
+        };
+
+        // Create the texture bind group
+        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Texture Bind Group"),
+            layout: &texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                },
+            ],
+        });
+
         // Create vertex shader module
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Vertex Shader"),
@@ -115,7 +177,7 @@ impl Renderer {
         // Create render pipeline
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&uniform_bind_group_layout],
+            bind_group_layouts: &[&uniform_bind_group_layout, &texture_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -168,6 +230,8 @@ impl Renderer {
             queue,
             pipeline,
             uniform_bind_group_layout,
+            texture_bind_group_layout,
+            texture_bind_group,
             width,
             height,
             sample_count,
@@ -324,6 +388,7 @@ impl Renderer {
 
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &uniform_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..u32::try_from(mesh.indices.len()).unwrap(), 0, 0..1);

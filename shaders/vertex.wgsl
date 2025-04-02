@@ -10,6 +10,7 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) tex_coords: vec2<f32>,
 }
 
 struct Uniforms {
@@ -32,9 +33,12 @@ fn vs_main(vert: VertexInput) -> VertexOutput {
     let normal = (uniforms.model * vec4<f32>(vert.normal, 0.0)).xyz;
     out.normal = normalize(normal);
     
-    // Basic vertex color based on normal for visualization
-    // Convert normal from [-1,1] to [0,1] range for color
-    out.color = (out.normal + 1.0) * 0.5;
+    // Use a flat white color instead of normal-based colors
+    // This will result in untextured areas being flat white
+    out.color = vec3<f32>(1.0, 1.0, 1.0);
+    
+    // Pass texture coordinates to fragment shader
+    out.tex_coords = vec2<f32>(vert.tex_coords.x, 1.0 - vert.tex_coords.y);
     
     return out;
 }

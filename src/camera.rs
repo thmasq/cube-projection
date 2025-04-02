@@ -88,10 +88,10 @@ impl Camera {
 
     pub fn get_projection_matrix(&self) -> Mat4 {
         // Create a flip Y matrix to invert the Y coordinates
-        let flip_y = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
+        let flip_xy = Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
 
         // Combine the flip with the orthographic projection
-        flip_y
+        flip_xy
             * Mat4::orthographic_rh(
                 self.left,
                 self.right,

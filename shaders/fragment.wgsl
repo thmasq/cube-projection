@@ -4,20 +4,19 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) tex_coords: vec2<f32>,
 }
+
+@group(1) @binding(0)
+var t_diffuse: texture_2d<f32>;
+@group(1) @binding(1)
+var s_diffuse: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Apply simple lighting model - diffuse only
-    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-    let diffuse = max(dot(in.normal, light_dir), 0.0);
+    let tex_color = textureSample(t_diffuse, s_diffuse, in.tex_coords);
     
-    // Final color: mix of ambient and diffuse lighting
-    let ambient = 0.2;
-    let light_color = vec3<f32>(1.0, 1.0, 1.0);
-    
-    let base_color = in.color;
-    let result = (ambient + diffuse) * base_color;
+    let result = select(in.color, tex_color.rgb, tex_color.a > 0.0);
     
     return vec4<f32>(result, 1.0);
 }

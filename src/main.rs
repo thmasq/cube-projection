@@ -1,6 +1,7 @@
 mod camera;
 mod mesh;
 mod renderer;
+mod texture;
 mod utils;
 
 use anyhow::Result;
@@ -25,6 +26,10 @@ struct Args {
     /// Anti-aliasing quality (0 = disabled, 1 = low, 2 = medium, 3 = high)
     #[arg(short = 'a', long, default_value_t = 2)]
     aa_quality: u8,
+
+    /// Path to texture file (optional, but lack thereof will result in plain white model, with no lighting)
+    #[arg(short = 't', long)]
+    texture: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -40,6 +45,16 @@ fn main() -> Result<()> {
     }
     if args.input.extension().unwrap_or_default() != "obj" {
         return Err(anyhow::anyhow!("Input must be an .obj file"));
+    }
+
+    if let Some(texture_path) = &args.texture {
+        if !texture_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Texture file does not exist: {:?}",
+                texture_path
+            ));
+        }
+        log::info!("Using texture from {}", texture_path.display());
     }
 
     // Create output directory if it doesn't exist
@@ -70,10 +85,12 @@ fn main() -> Result<()> {
         args.aa_quality
     );
 
+    // Create renderer with texture if provided
     let renderer = pollster::block_on(renderer::Renderer::new(
         args.size,
         args.size,
         args.aa_quality,
+        args.texture.as_deref(),
     ))?;
 
     // Create the cameras for each cube face with appropriate distance
