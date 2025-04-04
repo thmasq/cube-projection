@@ -1,11 +1,19 @@
 use anyhow::Result;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 
 pub fn save_image(data: &[u8], width: u32, height: u32, path: &Path) -> Result<()> {
-    let buffer = image::RgbaImage::from_raw(width, height, data.to_vec())
-        .ok_or_else(|| anyhow::anyhow!("Failed to create image from raw data"))?;
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
 
-    buffer.save(path)?;
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(data)?;
+
     Ok(())
 }
 

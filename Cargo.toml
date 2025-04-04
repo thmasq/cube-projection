@@ -11,6 +11,7 @@ env_logger = "0.11.7"
 glam = { version = "0.30.1", features = ["bytemuck"] }
 image = "0.25.6"
 log = "0.4.27"
+png = "0.17.16"
 pollster = "0.4.0"
 rayon = "1.10.0"
 tobj = "4.0.3"
