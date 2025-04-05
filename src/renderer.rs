@@ -26,11 +26,11 @@ pub struct Renderer {
     height: u32,
     sample_count: u32,
     background_color: wgpu::Color,
-    ping_buffers: Vec<wgpu::Buffer>,
-    pong_buffers: Vec<wgpu::Buffer>,
-    current_frame: usize,
+    device_buffers: Vec<wgpu::Buffer>,
+    staging_buffers: Vec<wgpu::Buffer>,
     buffer_alignment: u64,
     aligned_bytes_per_row: u32,
+    pending_readbacks: Vec<Option<wgpu::BufferSlice<'static>>>,
 }
 
 impl Renderer {
@@ -42,7 +42,6 @@ impl Renderer {
         background_color: Option<wgpu::Color>,
         backend_preference: &str,
     ) -> Result<Self> {
-        // Select appropriate backend based on preference
         let backends = match backend_preference.to_lowercase().as_str() {
             "vulkan" => wgpu::Backends::VULKAN,
             "opengl" => wgpu::Backends::GL,
@@ -139,10 +138,7 @@ impl Renderer {
                 &wgpu::DeviceDescriptor {
                     label: Some("Device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits {
-                        max_storage_buffers_per_shader_stage: 4,
-                        ..wgpu::Limits::default()
-                    },
+                    required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::default(),
                 },
                 None,
@@ -343,9 +339,9 @@ impl Renderer {
             height,
             sample_count,
             background_color,
-            ping_buffers: Vec::new(),
-            pong_buffers: Vec::new(),
-            current_frame: 0,
+            device_buffers: Vec::new(),
+            staging_buffers: Vec::new(),
+            pending_readbacks: Vec::new(),
             buffer_alignment,
             aligned_bytes_per_row,
         })
@@ -354,27 +350,32 @@ impl Renderer {
     pub fn init_readback_buffers(&mut self, face_count: usize) {
         let output_buffer_size = self.height as u64 * self.aligned_bytes_per_row as u64;
 
-        // Create ping-pong buffers for each face
-        for i in 0..face_count {
-            // Ping buffer
-            let ping = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("Ping Buffer {}", i)),
-                size: output_buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
+        // Create optimal device buffers (for fast GPU writes)
+        self.device_buffers = (0..face_count)
+            .map(|i| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("Device Buffer {}", i)),
+                    size: output_buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
 
-            // Pong buffer
-            let pong = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("Pong Buffer {}", i)),
-                size: output_buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
+        // Create staging buffers (for CPU reads)
+        self.staging_buffers = (0..face_count)
+            .map(|i| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("Staging Buffer {}", i)),
+                    size: output_buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
 
-            self.ping_buffers.push(ping);
-            self.pong_buffers.push(pong);
-        }
+        // Initialize pending readbacks vector
+        self.pending_readbacks = vec![None; face_count];
     }
 
     pub async fn render_cube_faces(
@@ -382,9 +383,11 @@ impl Renderer {
         mesh: &Mesh,
         cameras: &[Camera; 6],
     ) -> Result<Vec<Vec<u8>>> {
-        // Ensure we have ping-pong buffers
-        if self.ping_buffers.is_empty() {
-            self.init_readback_buffers(6);
+        let resource_start = std::time::Instant::now();
+
+        // Ensure we have the buffers
+        if self.device_buffers.is_empty() {
+            self.init_readback_buffers(cameras.len());
         }
 
         // Prepare GPU resources once for all renders
@@ -404,14 +407,6 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        // Get current set of buffers to write to
-        let current_buffers = if self.current_frame % 2 == 0 {
-            &self.ping_buffers
-        } else {
-            &self.pong_buffers
-        };
-
-        // Prepare texture extent once for all faces
         let texture_extent = wgpu::Extent3d {
             width: self.width,
             height: self.height,
@@ -419,19 +414,25 @@ impl Renderer {
         };
 
         // Create textures for all faces
-        let (render_textures, msaa_textures, depth_textures) = self.create_face_textures(6);
+        let (render_textures, msaa_textures, depth_textures) =
+            self.create_face_textures(cameras.len());
 
-        // Create a single CommandEncoder for all rendering
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Batch Render Encoder"),
-            });
+        let resource_prep_time = resource_start.elapsed();
+        let render_start = std::time::Instant::now();
 
-        // Submit all render passes first
+        // Process each face with overlapped rendering and readback
         for (i, camera) in cameras.iter().enumerate() {
+            // Create a command encoder for this face
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(&format!("Face {} Encoder", i)),
+                });
+
+            // Create uniform bind group for this camera
             let uniform_bind_group = self.create_uniform_bind_group(camera);
 
+            // Get the textures for this face
             let texture_view =
                 render_textures[i].create_view(&wgpu::TextureViewDescriptor::default());
             let msaa_view = msaa_textures
@@ -475,7 +476,7 @@ impl Renderer {
                 render_pass.draw_indexed(0..u32::try_from(mesh.indices.len()).unwrap(), 0, 0..1);
             }
 
-            // Record copy texture to buffer with optimal alignment
+            // Copy from texture to device buffer (optimal for GPU)
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture: &render_textures[i],
@@ -484,7 +485,7 @@ impl Renderer {
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {
-                    buffer: &current_buffers[i],
+                    buffer: &self.device_buffers[i],
                     layout: wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(self.aligned_bytes_per_row),
@@ -493,80 +494,103 @@ impl Renderer {
                 },
                 texture_extent,
             );
+
+            // Copy from device buffer to staging buffer (optimal for CPU)
+            encoder.copy_buffer_to_buffer(
+                &self.device_buffers[i],
+                0,
+                &self.staging_buffers[i],
+                0,
+                self.height as u64 * self.aligned_bytes_per_row as u64,
+            );
+
+            // Submit commands for this face immediately
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            // Start mapping this buffer asynchronously while next face renders
+            let buffer_slice = self.staging_buffers[i].slice(..);
+
+            // Use unsafe to extend the lifetime of the buffer slice
+            // This is safe because we ensure the buffer outlives this borrow
+            let buffer_slice = unsafe {
+                std::mem::transmute::<wgpu::BufferSlice<'_>, wgpu::BufferSlice<'static>>(
+                    buffer_slice,
+                )
+            };
+
+            buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+
+            // Store the pending readback
+            self.pending_readbacks[i] = Some(buffer_slice);
         }
 
-        // Submit all commands at once to allow the GPU to batch operations
-        self.queue.submit(std::iter::once(encoder.finish()));
+        let render_time = render_start.elapsed();
+        let readback_start = std::time::Instant::now();
 
-        // Create shared buffer to collect results
-        let results = Arc::new(Mutex::new(vec![Vec::new(); 6]));
-
-        // Start mapping all buffers in parallel
-        let mut mapping_receivers = Vec::with_capacity(current_buffers.len());
-
-        for (i, buffer) in current_buffers.iter().enumerate() {
-            let buffer_slice = buffer.slice(..);
-
-            // Create a channel to receive the mapping result
-            let (tx, rx) = std::sync::mpsc::channel();
-
-            // Map the buffer with a callback
-            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-                tx.send(result).unwrap();
-            });
-
-            mapping_receivers.push((i, buffer_slice, rx));
-        }
-
-        // Wait for GPU work to complete
+        // Poll until all buffers are mapped
         self.device.poll(wgpu::Maintain::Wait);
 
-        // Wait for all mapping operations to complete
-        for (_, _, rx) in &mapping_receivers {
-            rx.recv().unwrap().expect("Failed to map buffer");
-        }
+        // Process the mapped data in parallel using rayon
+        let width = self.width;
+        let height = self.height;
+        let aligned_bytes_per_row = self.aligned_bytes_per_row;
 
-        // Process mapped buffers in parallel using rayon::scope
-        // This ensures the threads don't outlive the scope of this method
+        let results = Arc::new(Mutex::new(vec![Vec::new(); cameras.len()]));
+
         rayon::scope(|s| {
-            for (i, buffer_slice, _) in mapping_receivers {
-                let results_clone = Arc::clone(&results);
-                let width = self.width;
-                let height = self.height;
-                let aligned_bytes_per_row = self.aligned_bytes_per_row;
+            for (i, buffer_slice_opt) in self.pending_readbacks.iter_mut().enumerate() {
+                if let Some(buffer_slice) = buffer_slice_opt.take() {
+                    let results_clone = Arc::clone(&results);
 
-                s.spawn(move |_| {
-                    // Get the buffer data
-                    let data = buffer_slice.get_mapped_range();
+                    s.spawn(move |_| {
+                        // Get the buffer data
+                        let data = buffer_slice.get_mapped_range();
+                        let output_size = (width * height * 4) as usize;
+                        let mut face_data = Vec::with_capacity(output_size);
 
-                    // Copy only the relevant bytes, skipping padding
-                    let mut face_data = Vec::with_capacity((width * height * 4) as usize);
+                        // OPTIMIZATION #4: Efficient padding removal with unsafe
+                        unsafe {
+                            let src_ptr: *const u8 = data.as_ptr();
+                            face_data.set_len(output_size);
+                            let dest_ptr: *mut u8 = face_data.as_mut_ptr();
 
-                    for row in 0..height {
-                        let row_start = (row * aligned_bytes_per_row) as usize;
-                        let row_end = row_start + (width * 4) as usize;
-                        face_data.extend_from_slice(&data[row_start..row_end]);
-                    }
+                            for row in 0..height {
+                                std::ptr::copy_nonoverlapping(
+                                    src_ptr.add((row * aligned_bytes_per_row) as usize),
+                                    dest_ptr.add((row * width * 4) as usize),
+                                    (width * 4) as usize,
+                                );
+                            }
+                        }
 
-                    // Release the mapped data
-                    drop(data);
+                        // Release the mapped range
+                        drop(data);
 
-                    // Store the result
-                    let mut results = results_clone.lock().unwrap();
-                    results[i] = face_data;
-                });
+                        // Store the result
+                        results_clone.lock().unwrap()[i] = face_data;
+                    });
+                }
             }
         });
 
-        // Unmap all buffers after processing
-        for buffer in current_buffers {
+        // Unmap all buffers
+        for buffer in &self.staging_buffers {
             buffer.unmap();
         }
 
-        // Toggle the current frame for ping-pong buffering
-        self.current_frame += 1;
+        let readback_time = readback_start.elapsed();
 
-        // Return the results
+        // Log detailed metrics
+        log::info!("Rendering metrics:");
+        log::info!("  Resource preparation: {:.2?}", resource_prep_time);
+        log::info!("  Render commands encoding: {:.2?}", render_time);
+        log::info!("  GPU execution and buffer readback: {:.2?}", readback_time);
+        log::info!(
+            "  Total rendering: {:.2?}",
+            resource_prep_time + render_time + readback_time
+        );
+
+        // Return the collected results
         Ok(Arc::try_unwrap(results).unwrap().into_inner().unwrap())
     }
 
