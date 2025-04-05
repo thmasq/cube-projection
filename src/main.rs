@@ -40,6 +40,11 @@ struct Args {
     /// Enable detailed performance metrics
     #[arg(short = 'm', long, default_value_t = false)]
     metrics: bool,
+
+    /// Graphics backend to use (vulkan, opengl, metal, dx12, software, auto)
+    /// Auto will try Vulkan first, then OpenGL/Metal, then software rendering
+    #[arg(short = 'g', long, default_value = "auto")]
+    graphics_backend: String,
 }
 
 fn main() -> Result<()> {
@@ -112,12 +117,21 @@ fn main() -> Result<()> {
         None
     };
 
+    if args.graphics_backend.to_lowercase() == "software" {
+        log::info!("Software rendering requested. Setting required environment variables.");
+        unsafe { std::env::set_var("WGPU_ADAPTER_NAME", "llvmpipe") };
+        if cfg!(target_os = "linux") {
+            unsafe { std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1") };
+        }
+    }
+
     let renderer = pollster::block_on(renderer::Renderer::new(
         args.size,
         args.size,
         args.aa_quality,
         args.texture.as_deref(),
         bg_color,
+        &args.graphics_backend,
     ))?;
     if args.metrics {
         log::info!("Renderer initialization: {:.2?}", renderer_start.elapsed());

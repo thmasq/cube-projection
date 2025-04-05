@@ -24,3 +24,6 @@ cargo build --release
 - `-b, --bg-color`: Background color as hex code (optional, default: gray)
   - Formats: RGB, RGBA, RRGGBB, or RRGGBBAA
   - Examples: `FF0000` (red), `00FF00FF` (opaque green), `00000000` (transparent)
+- `-g, --graphics-backend`: Graphics backend to use (default: auto)
+  - Options: `vulkan`, `opengl`, `metal`, `dx12`, `software`, `auto`
+  - Example: `-g software` to force CPU rendering

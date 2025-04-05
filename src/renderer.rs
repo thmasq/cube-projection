@@ -36,17 +36,99 @@ impl Renderer {
         aa_quality: u8,
         texture_path: Option<&Path>,
         background_color: Option<wgpu::Color>,
+        backend_preference: &str,
     ) -> Result<Self> {
-        // Initialize WGPU
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = instance
+        // Select appropriate backend based on preference
+        let backends = match backend_preference.to_lowercase().as_str() {
+            "vulkan" => wgpu::Backends::VULKAN,
+            "opengl" => wgpu::Backends::GL,
+            "metal" => wgpu::Backends::METAL,
+            "dx12" => wgpu::Backends::DX12,
+            "software" => {
+                // For software rendering, set environment variable if not already set
+                if std::env::var("WGPU_ADAPTER_NAME").is_err() {
+                    unsafe { std::env::set_var("WGPU_ADAPTER_NAME", "llvmpipe") };
+                }
+                wgpu::Backends::GL
+            }
+            "auto" => {
+                // Auto-selection with fallback priority
+                if cfg!(target_os = "macos") {
+                    // On macOS, prioritize Metal over OpenGL
+                    wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::GL
+                } else {
+                    // On other platforms
+                    wgpu::Backends::VULKAN | wgpu::Backends::GL | wgpu::Backends::DX12
+                }
+            }
+            _ => {
+                log::warn!(
+                    "Unknown backend '{}', falling back to auto-selection",
+                    backend_preference
+                );
+                wgpu::Backends::all()
+            }
+        };
+
+        // Initialize WGPU with selected backends
+        log::info!(
+            "Initializing graphics with backend preference: {}",
+            backend_preference
+        );
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+
+        let adapter_result = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
             })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Failed to find a suitable GPU adapter"))?;
+            .await;
+
+        // Try to get an adapter with the preferred backend
+        let adapter = match (backend_preference.to_lowercase().as_str(), adapter_result) {
+            ("vulkan", None) => {
+                return Err(anyhow::anyhow!(
+                    "Vulkan backend requested but not available. Try '-g opengl' or '-g auto'"
+                ));
+            }
+            ("opengl", None) => {
+                return Err(anyhow::anyhow!(
+                    "OpenGL backend requested but not available. Try '-g vulkan' or '-g auto'"
+                ));
+            }
+            ("metal", None) => {
+                return Err(anyhow::anyhow!(
+                    "Metal backend requested but not available. Try '-g opengl' or '-g auto'"
+                ));
+            }
+            ("dx12", None) => {
+                return Err(anyhow::anyhow!(
+                    "DirectX 12 backend requested but not available. Try '-g vulkan' or '-g auto'"
+                ));
+            }
+            ("software", None) => {
+                return Err(anyhow::anyhow!(
+                    "Software rendering requested but failed. Check your system configuration."
+                ));
+            }
+            (_, None) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to find a suitable GPU adapter with any backend"
+                ));
+            }
+            (_, Some(adapter)) => adapter,
+        };
+
+        // Log which backend was actually chosen
+        log::info!(
+            "Using adapter: {} (backend: {:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
 
         let (device, queue) = adapter
             .request_device(
