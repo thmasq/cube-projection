@@ -125,7 +125,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let renderer = pollster::block_on(renderer::Renderer::new(
+    let mut renderer = pollster::block_on(renderer::Renderer::new(
         args.size,
         args.size,
         args.aa_quality,

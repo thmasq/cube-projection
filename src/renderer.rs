@@ -5,7 +5,6 @@ use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -27,6 +26,11 @@ pub struct Renderer {
     height: u32,
     sample_count: u32,
     background_color: wgpu::Color,
+    ping_buffers: Vec<wgpu::Buffer>,
+    pong_buffers: Vec<wgpu::Buffer>,
+    current_frame: usize,
+    buffer_alignment: u64,
+    aligned_bytes_per_row: u32,
 }
 
 impl Renderer {
@@ -317,6 +321,14 @@ impl Renderer {
             a: 1.0,
         });
 
+        // Calculate optimal buffer alignment
+        let limits = device.limits();
+        let buffer_alignment = limits.min_storage_buffer_offset_alignment as u64;
+
+        // Calculate aligned bytes per row
+        let bytes_per_row = width * 4;
+        let aligned_bytes_per_row = ((bytes_per_row + 255) / 256) * 256;
+
         Ok(Self {
             device,
             queue,
@@ -328,14 +340,50 @@ impl Renderer {
             height,
             sample_count,
             background_color,
+            ping_buffers: Vec::new(),
+            pong_buffers: Vec::new(),
+            current_frame: 0,
+            buffer_alignment,
+            aligned_bytes_per_row,
         })
     }
 
+    pub fn init_readback_buffers(&mut self, face_count: usize) {
+        let output_buffer_size = self.height as u64 * self.aligned_bytes_per_row as u64;
+
+        // Create ping-pong buffers for each face
+        for i in 0..face_count {
+            // Ping buffer
+            let ping = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Ping Buffer {}", i)),
+                size: output_buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            // Pong buffer
+            let pong = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Pong Buffer {}", i)),
+                size: output_buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            self.ping_buffers.push(ping);
+            self.pong_buffers.push(pong);
+        }
+    }
+
     pub async fn render_cube_faces(
-        &self,
+        &mut self,
         mesh: &Mesh,
         cameras: &[Camera; 6],
     ) -> Result<Vec<Vec<u8>>> {
+        // Ensure we have ping-pong buffers
+        if self.ping_buffers.is_empty() {
+            self.init_readback_buffers(6);
+        }
+
         // Prepare GPU resources once for all renders
         let vertex_buffer = self
             .device
@@ -353,28 +401,12 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        // Create output buffer for each face
-        let output_buffer_size = self.width as u64 * self.height as u64 * 4;
-        let output_buffers: Vec<_> = (0..6)
-            .map(|i| {
-                self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("Output Buffer {}", i)),
-                    size: output_buffer_size,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-
-        // Create shared buffer to collect results
-        let results = Arc::new(Mutex::new(vec![Vec::new(); 6]));
-
-        // Create a single CommandEncoder
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Batch Render Encoder"),
-            });
+        // Get current set of buffers to write to
+        let current_buffers = if self.current_frame % 2 == 0 {
+            &self.ping_buffers
+        } else {
+            &self.pong_buffers
+        };
 
         // Prepare texture extent once for all faces
         let texture_extent = wgpu::Extent3d {
@@ -386,9 +418,15 @@ impl Renderer {
         // Create textures for all faces
         let (render_textures, msaa_textures, depth_textures) = self.create_face_textures(6);
 
+        // Create a single CommandEncoder for all rendering
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Batch Render Encoder"),
+            });
+
         // Submit all render passes first
         for (i, camera) in cameras.iter().enumerate() {
-            // Use the same encoder for all render passes
             let uniform_bind_group = self.create_uniform_bind_group(camera);
 
             let texture_view =
@@ -434,7 +472,7 @@ impl Renderer {
                 render_pass.draw_indexed(0..u32::try_from(mesh.indices.len()).unwrap(), 0, 0..1);
             }
 
-            // Record copy texture to buffer
+            // Record copy texture to buffer with optimal alignment
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture: &render_textures[i],
@@ -443,10 +481,10 @@ impl Renderer {
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {
-                    buffer: &output_buffers[i],
+                    buffer: &current_buffers[i],
                     layout: wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(self.width * 4),
+                        bytes_per_row: Some(self.aligned_bytes_per_row),
                         rows_per_image: Some(self.height),
                     },
                 },
@@ -457,45 +495,73 @@ impl Renderer {
         // Submit all commands at once to allow the GPU to batch operations
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Use multiple threads to handle buffer readback in parallel
-        let mut handles = vec![];
+        // Create shared buffer to collect results
+        let results = Arc::new(Mutex::new(vec![Vec::new(); 6]));
 
-        for (i, buffer) in output_buffers.iter().enumerate() {
-            let buffer_clone = buffer.clone();
-            let results_clone = Arc::clone(&results);
-            let device_clone = self.device.clone();
+        // Start mapping all buffers in parallel
+        let mut mapping_receivers = Vec::with_capacity(current_buffers.len());
 
-            let handle = thread::spawn(move || {
-                let buffer_slice = buffer_clone.slice(..);
+        for (i, buffer) in current_buffers.iter().enumerate() {
+            let buffer_slice = buffer.slice(..);
 
-                // Map the buffer asynchronously
-                let (tx, rx) = std::sync::mpsc::channel();
-                buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-                    tx.send(result).unwrap();
-                });
+            // Create a channel to receive the mapping result
+            let (tx, rx) = std::sync::mpsc::channel();
 
-                // Wait for the mapping to complete
-                device_clone.poll(wgpu::Maintain::Wait);
-                rx.recv().unwrap().expect("Failed to map buffer");
-
-                // Get the buffer data
-                let data = buffer_slice.get_mapped_range();
-                let face_data = data.to_vec();
-                drop(data);
-                buffer_clone.unmap();
-
-                // Store the result
-                let mut results = results_clone.lock().unwrap();
-                results[i] = face_data;
+            // Map the buffer with a callback
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
             });
 
-            handles.push(handle);
+            mapping_receivers.push((i, buffer_slice, rx));
         }
 
-        // Wait for all threads to complete
-        for handle in handles {
-            handle.join().expect("Thread panicked");
+        // Wait for GPU work to complete
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Wait for all mapping operations to complete
+        for (_, _, rx) in &mapping_receivers {
+            rx.recv().unwrap().expect("Failed to map buffer");
         }
+
+        // Process mapped buffers in parallel using rayon::scope
+        // This ensures the threads don't outlive the scope of this method
+        rayon::scope(|s| {
+            for (i, buffer_slice, _) in mapping_receivers {
+                let results_clone = Arc::clone(&results);
+                let width = self.width;
+                let height = self.height;
+                let aligned_bytes_per_row = self.aligned_bytes_per_row;
+
+                s.spawn(move |_| {
+                    // Get the buffer data
+                    let data = buffer_slice.get_mapped_range();
+
+                    // Copy only the relevant bytes, skipping padding
+                    let mut face_data = Vec::with_capacity((width * height * 4) as usize);
+
+                    for row in 0..height {
+                        let row_start = (row * aligned_bytes_per_row) as usize;
+                        let row_end = row_start + (width * 4) as usize;
+                        face_data.extend_from_slice(&data[row_start..row_end]);
+                    }
+
+                    // Release the mapped data
+                    drop(data);
+
+                    // Store the result
+                    let mut results = results_clone.lock().unwrap();
+                    results[i] = face_data;
+                });
+            }
+        });
+
+        // Unmap all buffers after processing
+        for buffer in current_buffers {
+            buffer.unmap();
+        }
+
+        // Toggle the current frame for ping-pong buffering
+        self.current_frame += 1;
 
         // Return the results
         Ok(Arc::try_unwrap(results).unwrap().into_inner().unwrap())
