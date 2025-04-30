@@ -1,0 +1,1156 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e38ade9..1653a44 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,3 +16,4 @@ pollster = "0.4.0"
+ rayon = "1.10.0"
+ tobj = "4.0.3"
+ wgpu = "24.0.3"
++winit = "0.30.9"
+diff --git a/src/camera.rs b/src/camera.rs
+index e7bf3bd..5779a8c 100644
+--- a/src/camera.rs
++++ b/src/camera.rs
+@@ -1,15 +1,35 @@
+ use glam::{Mat4, Vec3};
+ 
++pub enum ProjectionType {
++    Orthographic,
++    Perspective,
++}
++
+ pub struct Camera {
+     pub position: Vec3,
+     pub target: Vec3,
+     pub up: Vec3,
++
++    // Orthographic parameters
+     pub left: f32,
+     pub right: f32,
+     pub bottom: f32,
+     pub top: f32,
++
++    // Common parameters
+     pub near: f32,
+     pub far: f32,
++
++    // Perspective parameters
++    pub fov: f32,
++    pub aspect_ratio: f32,
++
++    // Camera orientation
++    pub yaw: f32,
++    pub pitch: f32,
++
++    // Projection type
++    pub projection_type: ProjectionType,
+ }
+ 
+ impl Camera {
+@@ -26,7 +46,44 @@ impl Camera {
+             bottom: -half_size,
+             top: half_size,
+             near: 0.1,
+-            far: 100.0, // Placeholder, will be calculated based on mesh bounds
++            far: 100.0,        // Placeholder, will be calculated based on mesh bounds
++            fov: 0.0,          // Not used for orthographic
++            aspect_ratio: 1.0, // Not used for orthographic
++            yaw: 0.0,          // Initialize to default
++            pitch: 0.0,        // Initialize to default
++            projection_type: ProjectionType::Orthographic,
++        }
++    }
++
++    pub fn new_perspective(
++        position: Vec3,
++        target: Vec3,
++        up: Vec3,
++        fov_degrees: f32,
++        aspect_ratio: f32,
++        near: f32,
++        far: f32,
++    ) -> Self {
++        // Calculate initial yaw and pitch from the given position and target
++        let direction = (target - position).normalize();
++        let pitch = (direction.y).asin();
++        let yaw = direction.z.atan2(direction.x);
++
++        Self {
++            position,
++            target,
++            up,
++            left: 0.0,   // Not used for perspective
++            right: 0.0,  // Not used for perspective
++            bottom: 0.0, // Not used for perspective
++            top: 0.0,    // Not used for perspective
++            near,
++            far,
++            fov: fov_degrees.to_radians(),
++            aspect_ratio,
++            yaw,
++            pitch,
++            projection_type: ProjectionType::Perspective,
+         }
+     }
+ 
+@@ -82,24 +139,102 @@ impl Camera {
+         );
+     }
+ 
++    // Update the camera direction based on yaw and pitch
++    fn update_camera_vectors(&mut self) {
++        // Calculate new front vector
++        let front = Vec3::new(
++            self.yaw.cos() * self.pitch.cos(),
++            self.pitch.sin(),
++            self.yaw.sin() * self.pitch.cos(),
++        )
++        .normalize();
++
++        // Update target based on position and front
++        self.target = self.position + front;
++    }
++
++    // Movement methods for interactive camera control
++    pub fn move_forward(&mut self, distance: f32) {
++        let front = (self.target - self.position).normalize();
++        self.position += front * distance;
++        self.target += front * distance;
++    }
++
++    pub fn move_right(&mut self, distance: f32) {
++        let front = (self.target - self.position).normalize();
++        let right = front.cross(self.up).normalize();
++        self.position += right * distance;
++        self.target += right * distance;
++    }
++
++    pub fn move_up(&mut self, distance: f32) {
++        let world_up = Vec3::new(0.0, 1.0, 0.0);
++        self.position += world_up * distance;
++        self.target += world_up * distance;
++    }
++
++    // Rotate the camera with yaw and pitch (in radians)
++    pub fn rotate(&mut self, yaw_delta: f32, pitch_delta: f32) {
++        // Update yaw and pitch
++        self.yaw += yaw_delta;
++        self.pitch -= pitch_delta; // Inverted to match mouse movement
++
++        // Constrain pitch to avoid gimbal lock
++        self.pitch = self.pitch.clamp(-1.5, 1.5); // Roughly ±85 degrees
++
++        // Update camera orientation
++        self.update_camera_vectors();
++    }
++
++    // Zoom by changing the FOV (for perspective) or size (for orthographic)
++    pub fn zoom(&mut self, amount: f32) {
++        match self.projection_type {
++            ProjectionType::Perspective => {
++                // Change FOV for perspective camera
++                self.fov = amount.mul_add(-0.05, self.fov).clamp(0.1, 2.0); // Limit FOV to sensible range
++            }
++            ProjectionType::Orthographic => {
++                // Change size for orthographic camera
++                let scale_factor = amount.mul_add(-0.05, 1.0);
++                self.left *= scale_factor;
++                self.right *= scale_factor;
++                self.top *= scale_factor;
++                self.bottom *= scale_factor;
++            }
++        }
++    }
++
++    // Update aspect ratio when window is resized
++    pub const fn set_aspect_ratio(&mut self, aspect_ratio: f32) {
++        self.aspect_ratio = aspect_ratio;
++    }
++
+     pub fn get_view_matrix(&self) -> Mat4 {
+         Mat4::look_at_rh(self.position, self.target, self.up)
+     }
+ 
+     pub fn get_projection_matrix(&self) -> Mat4 {
+-        // Create a flip Y matrix to invert the Y coordinates
+-        let flip_xy = Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
+-
+-        // Combine the flip with the orthographic projection
+-        flip_xy
+-            * Mat4::orthographic_rh(
+-                self.left,
+-                self.right,
+-                self.bottom,
+-                self.top,
+-                self.near,
+-                self.far,
+-            )
++        match self.projection_type {
++            ProjectionType::Orthographic => {
++                // Create a flip Y matrix to invert the Y coordinates
++                let flip_xy = Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
++
++                // Combine the flip with the orthographic projection
++                flip_xy
++                    * Mat4::orthographic_rh(
++                        self.left,
++                        self.right,
++                        self.bottom,
++                        self.top,
++                        self.near,
++                        self.far,
++                    )
++            }
++            ProjectionType::Perspective => {
++                // For perspective, we'll use the standard perspective matrix
++                Mat4::perspective_rh(self.fov, self.aspect_ratio, self.near, self.far)
++            }
++        }
+     }
+ 
+     pub fn get_view_proj_matrix(&self) -> Mat4 {
+diff --git a/src/main.rs b/src/main.rs
+index 07ba568..252f9df 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,6 @@
++mod application;
+ mod camera;
++mod input;
+ mod mesh;
+ mod renderer;
+ mod texture;
+@@ -7,7 +9,7 @@ mod utils;
+ use anyhow::Result;
+ use clap::Parser;
+ use std::path::PathBuf;
+-use std::time::Instant;
++use winit::event_loop::EventLoop;
+ 
+ #[derive(Parser, Debug)]
+ #[command(author, version, about, long_about = None)]
+@@ -45,132 +47,42 @@ struct Args {
+     /// Auto will try Vulkan first, then OpenGL/Metal, then software rendering
+     #[arg(short = 'g', long, default_value = "auto")]
+     graphics_backend: String,
++
++    /// Run in interactive mode with a window instead of generating cube face images
++    #[arg(short = 'w', long, default_value_t = false)]
++    window: bool,
+ }
+ 
+-fn main() -> Result<()> {
++fn run_interactive_mode(args: &Args) -> Result<()> {
++    // Initialize the logger
+     env_logger::init();
+-    let args = Args::parse();
+ 
+-    // Start total time measurement
+-    let start_total = Instant::now();
+-
+-    // Validate input file
+-    if !args.input.exists() {
+-        return Err(anyhow::anyhow!(
+-            "Input file does not exist: {:?}",
+-            args.input
+-        ));
+-    }
+-    if args.input.extension().unwrap_or_default() != "obj" {
+-        return Err(anyhow::anyhow!("Input must be an .obj file"));
+-    }
+-
+-    if let Some(texture_path) = &args.texture {
+-        if !texture_path.exists() {
+-            return Err(anyhow::anyhow!(
+-                "Texture file does not exist: {:?}",
+-                texture_path
+-            ));
+-        }
+-        log::info!("Using texture from {}", texture_path.display());
+-    }
+-
+-    // Create output directory if it doesn't exist
+-    if !args.output_dir.exists() {
+-        std::fs::create_dir_all(&args.output_dir)?;
+-    }
+-
+-    // Load the mesh
+-    let mesh_start = Instant::now();
+-    log::info!("Loading mesh from {}", args.input.display());
+-    let mesh = mesh::Mesh::load(&args.input)?;
+-    if args.metrics {
+-        log::info!("Mesh loading: {:.2?}", mesh_start.elapsed());
+-    }
+-
+-    // Calculate bounding box for proper camera positioning
+-    let bounds_start = Instant::now();
+-    let (min_bound, max_bound) = mesh.calculate_bounding_box();
+-    if args.metrics {
+-        log::info!("Bounding box calculation: {:.2?}", bounds_start.elapsed());
+-    }
+-
+-    // Create the cameras for each cube face with appropriate distance
+-    let cameras_start = Instant::now();
+-    let mut cameras = camera::create_cube_cameras(min_bound, max_bound);
+-    // Update in parallel
+-    rayon::scope(|s| {
+-        for camera in cameras.iter_mut() {
+-            s.spawn(|_| {
+-                camera.update_depth_for_mesh(min_bound, max_bound);
+-            });
+-        }
+-    });
+-    if args.metrics {
+-        log::info!("Camera setup: {:.2?}", cameras_start.elapsed());
+-    }
+-
+-    let renderer_start = Instant::now();
++    // Parse background color if provided
+     let bg_color = if let Some(hex) = &args.bg_color {
+         utils::parse_hex_color(hex).ok()
+     } else {
+         None
+     };
+ 
+-    if args.graphics_backend.to_lowercase() == "software" {
+-        log::info!("Software rendering requested. Setting required environment variables.");
+-        unsafe { std::env::set_var("WGPU_ADAPTER_NAME", "llvmpipe") };
+-        if cfg!(target_os = "linux") {
+-            unsafe { std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1") };
+-        }
+-    }
+-
+-    let mut renderer = pollster::block_on(renderer::Renderer::new(
+-        args.size,
+-        args.size,
+-        args.aa_quality,
+-        args.texture.as_deref(),
+-        bg_color,
+-        &args.graphics_backend,
+-    ))?;
+-    if args.metrics {
+-        log::info!("Renderer initialization: {:.2?}", renderer_start.elapsed());
+-    }
+-
+-    // Render all faces using our optimized batch renderer
+-    let render_start = Instant::now();
+-    let face_images = pollster::block_on(renderer.render_cube_faces(&mesh, &cameras))?;
+-    if args.metrics {
+-        log::info!("Batch rendering: {:.2?}", render_start.elapsed());
+-    }
+-
+-    // Save images in parallel
+-    let save_start = Instant::now();
+-    rayon::scope(|s| {
+-        for (i, image_data) in face_images.into_iter().enumerate() {
+-            let face_name = match i {
+-                0 => "positive_x",
+-                1 => "negative_x",
+-                2 => "positive_y",
+-                3 => "negative_y",
+-                4 => "positive_z",
+-                5 => "negative_z",
+-                _ => unreachable!(),
+-            };
+-
+-            let output_path = args.output_dir.join(format!("face_{face_name}.png"));
+-            let size = args.size;
+-
+-            s.spawn(move |_| {
+-                utils::save_image(&image_data, size, size, &output_path)
+-                    .expect("Failed to save image");
+-            });
+-        }
+-    });
+-    if args.metrics {
+-        log::info!("Image saving: {:.2?}", save_start.elapsed());
+-    }
+-
+-    log::info!("Total execution time: {:.2?}", start_total.elapsed());
++    // Create event loop
++    let event_loop = EventLoop::new()?;
++
++    // Create and initialize application
++    let mut app = application::Application::new();
++    app.initialize(&event_loop, &args.input, args.texture.as_deref(), bg_color)?;
++
++    // Run the event loop
++    log::info!("Starting interactive mode");
++    log::info!("Controls: WASD to move, Right mouse button + drag to rotate, Mouse wheel to zoom");
++    log::info!("         Space to move up, Shift to move down, ESC to exit");
++
++    event_loop.run_app(&mut app)?;
++
+     Ok(())
+ }
++
++fn main() -> Result<()> {
++    let args = Args::parse();
++
++    run_interactive_mode(&args)
++}
+diff --git a/src/mesh.rs b/src/mesh.rs
+index 8f504e6..34cddfb 100644
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -251,7 +251,7 @@ impl Mesh {
+     // Parallel version of bounding box calculation for large meshes
+     fn calculate_bounding_box_parallel(&self) -> (glam::Vec3, glam::Vec3) {
+         const CHUNK_SIZE: usize = 5000;
+-        let chunk_count = (self.vertices.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
++        let chunk_count = self.vertices.len().div_ceil(CHUNK_SIZE);
+ 
+         let min_max = Arc::new(Mutex::new(vec![
+             (
+diff --git a/src/renderer.rs b/src/renderer.rs
+index afc3541..322fc0d 100644
+--- a/src/renderer.rs
++++ b/src/renderer.rs
+@@ -3,9 +3,9 @@ use crate::mesh::{Mesh, Vertex};
+ use crate::texture::Texture;
+ use anyhow::Result;
+ use bytemuck::{Pod, Zeroable};
+-use std::path::Path;
+ use std::sync::{Arc, Mutex};
+ use wgpu::util::DeviceExt;
++use winit::window::Window;
+ 
+ #[repr(C)]
+ #[derive(Copy, Clone, Debug, Pod, Zeroable)]
+@@ -16,12 +16,17 @@ struct Uniforms {
+ 
+ #[allow(dead_code)]
+ pub struct Renderer {
++    // No lifetime parameter
+     device: wgpu::Device,
+     queue: wgpu::Queue,
+     pipeline: wgpu::RenderPipeline,
+     uniform_bind_group_layout: wgpu::BindGroupLayout,
+     texture_bind_group_layout: wgpu::BindGroupLayout,
+     texture_bind_group: wgpu::BindGroup,
++    surface: Option<wgpu::Surface<'static>>, // Use 'static lifetime
++    surface_config: Option<wgpu::SurfaceConfiguration>,
++
++    // Image rendering related fields
+     width: u32,
+     height: u32,
+     sample_count: u32,
+@@ -31,108 +36,52 @@ pub struct Renderer {
+     buffer_alignment: u64,
+     aligned_bytes_per_row: u32,
+     pending_readbacks: Vec<Option<wgpu::BufferSlice<'static>>>,
++
++    // Mesh rendering resources
++    vertex_buffer: Option<wgpu::Buffer>,
++    index_buffer: Option<wgpu::Buffer>,
++    index_count: u32,
++
++    // MSAA and depth texture for window rendering
++    msaa_texture: Option<wgpu::Texture>,
++    depth_texture: Option<wgpu::Texture>,
+ }
+ 
+ impl Renderer {
+-    pub async fn new(
+-        width: u32,
+-        height: u32,
+-        aa_quality: u8,
+-        texture_path: Option<&Path>,
++    // New constructor for window-based rendering
++    pub async fn new_with_window(
++        window: &Window,
++        aa_quality: Option<u8>,
+         background_color: Option<wgpu::Color>,
+-        backend_preference: &str,
+     ) -> Result<Self> {
+-        let backends = match backend_preference.to_lowercase().as_str() {
+-            "vulkan" => wgpu::Backends::VULKAN,
+-            "opengl" => wgpu::Backends::GL,
+-            "metal" => wgpu::Backends::METAL,
+-            "dx12" => wgpu::Backends::DX12,
+-            "software" => {
+-                // For software rendering, set environment variable if not already set
+-                if std::env::var("WGPU_ADAPTER_NAME").is_err() {
+-                    unsafe { std::env::set_var("WGPU_ADAPTER_NAME", "llvmpipe") };
+-                }
+-                wgpu::Backends::GL
+-            }
+-            "auto" => {
+-                // Auto-selection with fallback priority
+-                if cfg!(target_os = "macos") {
+-                    // On macOS, prioritize Metal over OpenGL
+-                    wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::GL
+-                } else {
+-                    // On other platforms
+-                    wgpu::Backends::VULKAN | wgpu::Backends::GL | wgpu::Backends::DX12
+-                }
+-            }
+-            _ => {
+-                log::warn!(
+-                    "Unknown backend '{}', falling back to auto-selection",
+-                    backend_preference
+-                );
+-                wgpu::Backends::all()
+-            }
+-        };
+-
+-        // Initialize WGPU with selected backends
+-        log::info!(
+-            "Initializing graphics with backend preference: {}",
+-            backend_preference
+-        );
++        // Create instance
+         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+-            backends,
++            backends: wgpu::Backends::all(),
+             ..Default::default()
+         });
+ 
+-        let adapter_result = instance
++        let surface = unsafe {
++            let surface = instance.create_surface(window)?;
++            std::mem::transmute::<wgpu::Surface<'_>, wgpu::Surface<'static>>(surface)
++        };
++
++        // Request adapter
++        let adapter = instance
+             .request_adapter(&wgpu::RequestAdapterOptions {
+                 power_preference: wgpu::PowerPreference::HighPerformance,
+                 force_fallback_adapter: false,
+-                compatible_surface: None,
++                compatible_surface: Some(&surface),
+             })
+-            .await;
++            .await
++            .ok_or_else(|| anyhow::anyhow!("Failed to find a suitable GPU adapter"))?;
+ 
+-        // Try to get an adapter with the preferred backend
+-        let adapter = match (backend_preference.to_lowercase().as_str(), adapter_result) {
+-            ("vulkan", None) => {
+-                return Err(anyhow::anyhow!(
+-                    "Vulkan backend requested but not available. Try '-g opengl' or '-g auto'"
+-                ));
+-            }
+-            ("opengl", None) => {
+-                return Err(anyhow::anyhow!(
+-                    "OpenGL backend requested but not available. Try '-g vulkan' or '-g auto'"
+-                ));
+-            }
+-            ("metal", None) => {
+-                return Err(anyhow::anyhow!(
+-                    "Metal backend requested but not available. Try '-g opengl' or '-g auto'"
+-                ));
+-            }
+-            ("dx12", None) => {
+-                return Err(anyhow::anyhow!(
+-                    "DirectX 12 backend requested but not available. Try '-g vulkan' or '-g auto'"
+-                ));
+-            }
+-            ("software", None) => {
+-                return Err(anyhow::anyhow!(
+-                    "Software rendering requested but failed. Check your system configuration."
+-                ));
+-            }
+-            (_, None) => {
+-                return Err(anyhow::anyhow!(
+-                    "Failed to find a suitable GPU adapter with any backend"
+-                ));
+-            }
+-            (_, Some(adapter)) => adapter,
+-        };
+-
+-        // Log which backend was actually chosen
+         log::info!(
+             "Using adapter: {} (backend: {:?})",
+             adapter.get_info().name,
+             adapter.get_info().backend
+         );
+ 
++        // Request device
+         let (device, queue) = adapter
+             .request_device(
+                 &wgpu::DeviceDescriptor {
+@@ -145,20 +94,40 @@ impl Renderer {
+             )
+             .await?;
+ 
+-        // Determine sample count based on quality and adapter capabilities
+-        let sample_flags = adapter
+-            .get_texture_format_features(wgpu::TextureFormat::Rgba8Unorm)
+-            .flags;
+-
+-        // Map quality level to sample count
+-        let requested_samples = match aa_quality {
+-            0 => 1, // No AA
+-            1 => 2, // Low
+-            2 => 4, // Medium (default)
+-            _ => 8, // High or any other value
++        // Configure surface
++        let window_size = window.inner_size();
++        let surface_caps = surface.get_capabilities(&adapter);
++        let format = surface_caps
++            .formats
++            .iter()
++            .copied()
++            .find(wgpu::TextureFormat::is_srgb)
++            .unwrap_or(surface_caps.formats[0]);
++
++        let surface_config = wgpu::SurfaceConfiguration {
++            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
++            format,
++            width: window_size.width,
++            height: window_size.height,
++            present_mode: wgpu::PresentMode::Fifo, // VSync
++            desired_maximum_frame_latency: 2,
++            alpha_mode: surface_caps.alpha_modes[0],
++            view_formats: vec![],
++        };
++
++        surface.configure(&device, &surface_config);
++
++        // Determine sample count
++        let sample_count = match aa_quality {
++            Some(0) => 1,        // No AA
++            Some(1) => 2,        // Low
++            Some(2) | None => 4, // Medium (default)
++            Some(_) => 8,        // High or any other value
+         };
+ 
+         // Check adapter support
++        let sample_flags = adapter.get_texture_format_features(format).flags;
++
+         let max_sample_count =
+             if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X8) {
+                 8
+@@ -171,15 +140,15 @@ impl Renderer {
+             };
+ 
+         // Use requested sample count or the maximum available if lower
+-        let sample_count = requested_samples.min(max_sample_count);
++        let sample_count = sample_count.min(max_sample_count);
+ 
+         if sample_count > 1 {
+-            log::info!("Using MSAA with {} samples", sample_count);
++            log::info!("Using MSAA with {sample_count} samples");
+         } else {
+             log::info!("MSAA disabled");
+         }
+ 
+-        // Create bind group layout for uniforms
++        // Create bind group layouts
+         let uniform_bind_group_layout =
+             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                 label: Some("Uniform Bind Group Layout"),
+@@ -195,7 +164,6 @@ impl Renderer {
+                 }],
+             });
+ 
+-        // Create bind group layout for texture
+         let texture_bind_group_layout =
+             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                 label: Some("Texture Bind Group Layout"),
+@@ -221,16 +189,10 @@ impl Renderer {
+                 ],
+             });
+ 
+-        // Load texture or create default white texture
+-        let texture = match texture_path {
+-            Some(path) => Texture::load(&device, &queue, path)?,
+-            None => {
+-                log::info!("No texture provided. Using default white texture.");
+-                Texture::create_default(&device, &queue)
+-            }
+-        };
++        // Create default texture
++        let texture = Texture::create_default(&device, &queue);
+ 
+-        // Create the texture bind group
++        // Create texture bind group
+         let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+             label: Some("Texture Bind Group"),
+             layout: &texture_bind_group_layout,
+@@ -246,7 +208,7 @@ impl Renderer {
+             ],
+         });
+ 
+-        // Create vertex shader module
++        // Create shaders
+         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("Vertex Shader"),
+             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+@@ -254,7 +216,6 @@ impl Renderer {
+             ))),
+         });
+ 
+-        // Create fragment shader module
+         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("Fragment Shader"),
+             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+@@ -262,7 +223,7 @@ impl Renderer {
+             ))),
+         });
+ 
+-        // Create render pipeline
++        // Create pipeline
+         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: Some("Render Pipeline Layout"),
+             bind_group_layouts: &[&uniform_bind_group_layout, &texture_bind_group_layout],
+@@ -282,7 +243,7 @@ impl Renderer {
+                 module: &fragment_shader,
+                 entry_point: Some("fs_main"),
+                 targets: &[Some(wgpu::ColorTargetState {
+-                    format: wgpu::TextureFormat::Rgba8Unorm,
++                    format,
+                     blend: Some(wgpu::BlendState::REPLACE),
+                     write_mask: wgpu::ColorWrites::ALL,
+                 })],
+@@ -314,47 +275,246 @@ impl Renderer {
+         });
+ 
+         let background_color = background_color.unwrap_or(wgpu::Color {
+-            r: 0.5,
+-            g: 0.5,
+-            b: 0.5,
++            r: 0.1,
++            g: 0.1,
++            b: 0.1,
+             a: 1.0,
+         });
+ 
+-        // Calculate optimal buffer alignment
+-        let limits = device.limits();
+-        let buffer_alignment = limits.min_storage_buffer_offset_alignment as u64;
++        // Create MSAA and depth textures
++        let msaa_texture = if sample_count > 1 {
++            Some(create_msaa_texture(
++                &device,
++                window_size.width,
++                window_size.height,
++                sample_count,
++                format,
++            ))
++        } else {
++            None
++        };
+ 
+-        // Calculate aligned bytes per row
+-        let bytes_per_row = width * 4;
+-        let aligned_bytes_per_row = ((bytes_per_row + 255) / 256) * 256;
++        let depth_texture =
++            create_depth_texture(&device, window_size.width, window_size.height, sample_count);
+ 
+         Ok(Self {
+-            device,
++            device: device.clone(),
+             queue,
+             pipeline,
+             uniform_bind_group_layout,
+             texture_bind_group_layout,
+             texture_bind_group,
+-            width,
+-            height,
++            surface: Some(surface),
++            surface_config: Some(surface_config),
++            width: window_size.width,
++            height: window_size.height,
+             sample_count,
+             background_color,
+             device_buffers: Vec::new(),
+             staging_buffers: Vec::new(),
+             pending_readbacks: Vec::new(),
+-            buffer_alignment,
+-            aligned_bytes_per_row,
++            buffer_alignment: 0,      // Not used for window rendering
++            aligned_bytes_per_row: 0, // Not used for window rendering
++            vertex_buffer: None,
++            index_buffer: None,
++            index_count: 0,
++            msaa_texture: Some(msaa_texture.unwrap_or_else(|| {
++                create_msaa_texture(
++                    &device,
++                    window_size.width,
++                    window_size.height,
++                    1, // No MSAA
++                    format,
++                )
++            })),
++            depth_texture: Some(depth_texture),
+         })
+     }
+ 
++    // Resize the surface and related textures
++    pub fn resize(&mut self, width: u32, height: u32) {
++        if width == 0 || height == 0 {
++            return; // Ignore invalid sizes
++        }
++
++        if let Some(config) = &mut self.surface_config {
++            config.width = width;
++            config.height = height;
++
++            if let Some(surface) = &self.surface {
++                surface.configure(&self.device, config);
++
++                // Recreate MSAA texture
++                if self.sample_count > 1 {
++                    self.msaa_texture = Some(create_msaa_texture(
++                        &self.device,
++                        width,
++                        height,
++                        self.sample_count,
++                        config.format,
++                    ));
++                }
++
++                // Recreate depth texture
++                self.depth_texture = Some(create_depth_texture(
++                    &self.device,
++                    width,
++                    height,
++                    self.sample_count,
++                ));
++            }
++        }
++
++        self.width = width;
++        self.height = height;
++    }
++
++    // Load mesh data to GPU
++    pub fn load_mesh(&mut self, mesh: &Mesh) {
++        self.vertex_buffer = Some(self.device.create_buffer_init(
++            &wgpu::util::BufferInitDescriptor {
++                label: Some("Vertex Buffer"),
++                contents: bytemuck::cast_slice(&mesh.vertices),
++                usage: wgpu::BufferUsages::VERTEX,
++            },
++        ));
++
++        self.index_buffer = Some(self.device.create_buffer_init(
++            &wgpu::util::BufferInitDescriptor {
++                label: Some("Index Buffer"),
++                contents: bytemuck::cast_slice(&mesh.indices),
++                usage: wgpu::BufferUsages::INDEX,
++            },
++        ));
++
++        self.index_count = u32::try_from(mesh.indices.len()).unwrap();
++    }
++
++    // Render to window surface
++    pub fn render_to_window(&mut self, mesh: &Mesh, camera: &Camera) -> Result<()> {
++        // Ensure mesh data is loaded
++        if self.vertex_buffer.is_none() || self.index_buffer.is_none() {
++            self.load_mesh(mesh);
++        }
++
++        // Get the surface texture
++        let surface = self.surface.as_ref().unwrap();
++        let frame = surface
++            .get_current_texture()
++            .map_err(|e| anyhow::anyhow!("Failed to get surface texture: {:?}", e))?;
++
++        let view = frame
++            .texture
++            .create_view(&wgpu::TextureViewDescriptor::default());
++
++        // Create uniform bind group for this frame
++        let uniform_buffer = self.create_uniform_buffer(camera);
++        let uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("Uniform Bind Group"),
++            layout: &self.uniform_bind_group_layout,
++            entries: &[wgpu::BindGroupEntry {
++                binding: 0,
++                resource: uniform_buffer.as_entire_binding(),
++            }],
++        });
++
++        // Get MSAA and depth views
++        let msaa_view = self
++            .msaa_texture
++            .as_ref()
++            .unwrap()
++            .create_view(&wgpu::TextureViewDescriptor::default());
++        let depth_view = self
++            .depth_texture
++            .as_ref()
++            .unwrap()
++            .create_view(&wgpu::TextureViewDescriptor::default());
++
++        // Create command encoder
++        let mut encoder = self
++            .device
++            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
++                label: Some("Render Encoder"),
++            });
++
++        // Record render pass
++        {
++            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("Render Pass"),
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: if self.sample_count > 1 {
++                        &msaa_view
++                    } else {
++                        &view
++                    },
++                    resolve_target: if self.sample_count > 1 {
++                        Some(&view)
++                    } else {
++                        None
++                    },
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(self.background_color),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                    view: &depth_view,
++                    depth_ops: Some(wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(1.0),
++                        store: wgpu::StoreOp::Store,
++                    }),
++                    stencil_ops: None,
++                }),
++                occlusion_query_set: None,
++                timestamp_writes: None,
++            });
++
++            render_pass.set_pipeline(&self.pipeline);
++            render_pass.set_bind_group(0, &uniform_bind_group, &[]);
++            render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
++            render_pass.set_vertex_buffer(0, self.vertex_buffer.as_ref().unwrap().slice(..));
++            render_pass.set_index_buffer(
++                self.index_buffer.as_ref().unwrap().slice(..),
++                wgpu::IndexFormat::Uint32,
++            );
++            render_pass.draw_indexed(0..self.index_count, 0, 0..1);
++        }
++
++        // Submit command buffer
++        self.queue.submit(std::iter::once(encoder.finish()));
++
++        // Present the frame
++        frame.present();
++
++        Ok(())
++    }
++
++    // Helper method to create a uniform buffer for a camera
++    fn create_uniform_buffer(&self, camera: &Camera) -> wgpu::Buffer {
++        let view_proj = camera.get_view_proj_matrix();
++        let model = glam::Mat4::IDENTITY;
++
++        let uniforms = Uniforms {
++            view_proj: view_proj.to_cols_array_2d(),
++            model: model.to_cols_array_2d(),
++        };
++
++        self.device
++            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
++                label: Some("Uniform Buffer"),
++                contents: bytemuck::cast_slice(&[uniforms]),
++                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++            })
++    }
++
+     pub fn init_readback_buffers(&mut self, face_count: usize) {
+-        let output_buffer_size = self.height as u64 * self.aligned_bytes_per_row as u64;
++        let output_buffer_size = u64::from(self.height) * u64::from(self.aligned_bytes_per_row);
+ 
+         // Create optimal device buffers (for fast GPU writes)
+         self.device_buffers = (0..face_count)
+             .map(|i| {
+                 self.device.create_buffer(&wgpu::BufferDescriptor {
+-                    label: Some(&format!("Device Buffer {}", i)),
++                    label: Some(&format!("Device Buffer {i}")),
+                     size: output_buffer_size,
+                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                     mapped_at_creation: false,
+@@ -366,7 +526,7 @@ impl Renderer {
+         self.staging_buffers = (0..face_count)
+             .map(|i| {
+                 self.device.create_buffer(&wgpu::BufferDescriptor {
+-                    label: Some(&format!("Staging Buffer {}", i)),
++                    label: Some(&format!("Staging Buffer {i}")),
+                     size: output_buffer_size,
+                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                     mapped_at_creation: false,
+@@ -426,11 +586,21 @@ impl Renderer {
+             let mut encoder = self
+                 .device
+                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+-                    label: Some(&format!("Face {} Encoder", i)),
++                    label: Some(&format!("Face {i} Encoder")),
+                 });
+ 
++            // Create uniform buffer
++            let uniform_buffer = self.create_uniform_buffer(camera);
++
+             // Create uniform bind group for this camera
+-            let uniform_bind_group = self.create_uniform_bind_group(camera);
++            let uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("Uniform Bind Group"),
++                layout: &self.uniform_bind_group_layout,
++                entries: &[wgpu::BindGroupEntry {
++                    binding: 0,
++                    resource: uniform_buffer.as_entire_binding(),
++                }],
++            });
+ 
+             // Get the textures for this face
+             let texture_view =
+@@ -443,7 +613,7 @@ impl Renderer {
+             // Record render pass
+             {
+                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+-                    label: Some(&format!("Render Pass {}", i)),
++                    label: Some(&format!("Render Pass {i}")),
+                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                         view: msaa_view.as_ref().unwrap_or(&texture_view),
+                         resolve_target: if self.sample_count > 1 {
+@@ -501,7 +671,7 @@ impl Renderer {
+                 0,
+                 &self.staging_buffers[i],
+                 0,
+-                self.height as u64 * self.aligned_bytes_per_row as u64,
++                u64::from(self.height) * u64::from(self.aligned_bytes_per_row),
+             );
+ 
+             // Submit commands for this face immediately
+@@ -582,9 +752,9 @@ impl Renderer {
+ 
+         // Log detailed metrics
+         log::info!("Rendering metrics:");
+-        log::info!("  Resource preparation: {:.2?}", resource_prep_time);
+-        log::info!("  Render commands encoding: {:.2?}", render_time);
+-        log::info!("  GPU execution and buffer readback: {:.2?}", readback_time);
++        log::info!("  Resource preparation: {resource_prep_time:.2?}");
++        log::info!("  Render commands encoding: {render_time:.2?}");
++        log::info!("  GPU execution and buffer readback: {readback_time:.2?}");
+         log::info!(
+             "  Total rendering: {:.2?}",
+             resource_prep_time + render_time + readback_time
+@@ -608,7 +778,7 @@ impl Renderer {
+         let render_textures: Vec<_> = (0..count)
+             .map(|i| {
+                 self.device.create_texture(&wgpu::TextureDescriptor {
+-                    label: Some(&format!("Render Texture {}", i)),
++                    label: Some(&format!("Render Texture {i}")),
+                     size: texture_extent,
+                     mip_level_count: 1,
+                     sample_count: 1,
+@@ -624,7 +794,7 @@ impl Renderer {
+             (0..count)
+                 .map(|i| {
+                     self.device.create_texture(&wgpu::TextureDescriptor {
+-                        label: Some(&format!("Multisampled Texture {}", i)),
++                        label: Some(&format!("Multisampled Texture {i}")),
+                         size: texture_extent,
+                         mip_level_count: 1,
+                         sample_count: self.sample_count,
+@@ -642,7 +812,7 @@ impl Renderer {
+         let depth_textures: Vec<_> = (0..count)
+             .map(|i| {
+                 self.device.create_texture(&wgpu::TextureDescriptor {
+-                    label: Some(&format!("Depth Texture {}", i)),
++                    label: Some(&format!("Depth Texture {i}")),
+                     size: texture_extent,
+                     mip_level_count: 1,
+                     sample_count: self.sample_count,
+@@ -656,32 +826,51 @@ impl Renderer {
+ 
+         (render_textures, msaa_textures, depth_textures)
+     }
++}
+ 
+-    // Helper method to create a uniform bind group for a camera
+-    fn create_uniform_bind_group(&self, camera: &Camera) -> wgpu::BindGroup {
+-        let view_proj = camera.get_view_proj_matrix();
+-        let model = glam::Mat4::IDENTITY;
+-
+-        let uniforms = Uniforms {
+-            view_proj: view_proj.to_cols_array_2d(),
+-            model: model.to_cols_array_2d(),
+-        };
+-
+-        let uniform_buffer = self
+-            .device
+-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+-                label: Some("Uniform Buffer"),
+-                contents: bytemuck::cast_slice(&[uniforms]),
+-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+-            });
++// Helper function to create MSAA texture
++fn create_msaa_texture(
++    device: &wgpu::Device,
++    width: u32,
++    height: u32,
++    sample_count: u32,
++    format: wgpu::TextureFormat,
++) -> wgpu::Texture {
++    device.create_texture(&wgpu::TextureDescriptor {
++        label: Some("MSAA Texture"),
++        size: wgpu::Extent3d {
++            width,
++            height,
++            depth_or_array_layers: 1,
++        },
++        mip_level_count: 1,
++        sample_count,
++        dimension: wgpu::TextureDimension::D2,
++        format,
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
++        view_formats: &[],
++    })
++}
+ 
+-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+-            label: Some("Uniform Bind Group"),
+-            layout: &self.uniform_bind_group_layout,
+-            entries: &[wgpu::BindGroupEntry {
+-                binding: 0,
+-                resource: uniform_buffer.as_entire_binding(),
+-            }],
+-        })
+-    }
++// Helper function to create depth texture
++fn create_depth_texture(
++    device: &wgpu::Device,
++    width: u32,
++    height: u32,
++    sample_count: u32,
++) -> wgpu::Texture {
++    device.create_texture(&wgpu::TextureDescriptor {
++        label: Some("Depth Texture"),
++        size: wgpu::Extent3d {
++            width,
++            height,
++            depth_or_array_layers: 1,
++        },
++        mip_level_count: 1,
++        sample_count,
++        dimension: wgpu::TextureDimension::D2,
++        format: wgpu::TextureFormat::Depth32Float,
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
++        view_formats: &[],
++    })
+ }
+diff --git a/src/utils.rs b/src/utils.rs
+index 1ae21a4..2a93cae 100644
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -60,9 +60,9 @@ pub fn parse_hex_color(hex: &str) -> Result<wgpu::Color> {
+ 
+     // Convert to 0.0-1.0 range
+     Ok(wgpu::Color {
+-        r: r as f64 / 255.0,
+-        g: g as f64 / 255.0,
+-        b: b as f64 / 255.0,
+-        a: a as f64 / 255.0,
++        r: f64::from(r) / 255.0,
++        g: f64::from(g) / 255.0,
++        b: f64::from(b) / 255.0,
++        a: f64::from(a) / 255.0,
+     })
+ }

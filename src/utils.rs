@@ -60,9 +60,9 @@ pub fn parse_hex_color(hex: &str) -> Result<wgpu::Color> {
 
     // Convert to 0.0-1.0 range
     Ok(wgpu::Color {
-        r: r as f64 / 255.0,
-        g: g as f64 / 255.0,
-        b: b as f64 / 255.0,
-        a: a as f64 / 255.0,
+        r: f64::from(r) / 255.0,
+        g: f64::from(g) / 255.0,
+        b: f64::from(b) / 255.0,
+        a: f64::from(a) / 255.0,
     })
 }

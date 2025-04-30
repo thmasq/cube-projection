@@ -251,7 +251,7 @@ impl Mesh {
     // Parallel version of bounding box calculation for large meshes
     fn calculate_bounding_box_parallel(&self) -> (glam::Vec3, glam::Vec3) {
         const CHUNK_SIZE: usize = 5000;
-        let chunk_count = (self.vertices.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let chunk_count = self.vertices.len().div_ceil(CHUNK_SIZE);
 
         let min_max = Arc::new(Mutex::new(vec![
             (
