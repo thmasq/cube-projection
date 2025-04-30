@@ -1,9 +1,11 @@
+// application.rs
+
 use crate::camera::Camera;
 use crate::input::InputState;
 use crate::mesh::Mesh;
 use crate::renderer::Renderer;
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -21,6 +23,8 @@ pub struct Application {
     last_frame_time: Instant,
     frame_count: u64,
     frame_time_accumulator: Duration,
+    texture_path: Option<PathBuf>, // Add this field
+    bg_color: Option<wgpu::Color>, // Add this field too
 }
 
 impl Application {
@@ -34,6 +38,8 @@ impl Application {
             last_frame_time: Instant::now(),
             frame_count: 0,
             frame_time_accumulator: Duration::from_secs(0),
+            texture_path: None,
+            bg_color: None,
         }
     }
 
@@ -44,8 +50,6 @@ impl Application {
         texture_path: Option<&Path>,
         bg_color: Option<wgpu::Color>,
     ) -> Result<()> {
-        let _ = bg_color;
-        let _ = texture_path;
         let _ = event_loop;
         log::info!("Initializing application");
 
@@ -72,6 +76,9 @@ impl Application {
             distance * 4.0,
         );
 
+        self.texture_path = texture_path.map(PathBuf::from);
+        self.bg_color = bg_color;
+
         self.mesh = Some(mesh);
         self.camera = Some(camera);
 
@@ -84,22 +91,22 @@ impl Application {
         if let Some(camera) = &mut self.camera {
             // Update camera based on input
             if self.input_state.keyboard.key_pressed(KeyCode::KeyW) {
-                camera.move_forward(delta_time * 2.0);
+                camera.move_forward(delta_time * 30.0);
             }
             if self.input_state.keyboard.key_pressed(KeyCode::KeyS) {
-                camera.move_forward(-delta_time * 2.0);
+                camera.move_forward(-delta_time * 30.0);
             }
             if self.input_state.keyboard.key_pressed(KeyCode::KeyA) {
-                camera.move_right(-delta_time * 2.0);
+                camera.move_right(-delta_time * 30.0);
             }
             if self.input_state.keyboard.key_pressed(KeyCode::KeyD) {
-                camera.move_right(delta_time * 2.0);
+                camera.move_right(delta_time * 30.0);
             }
             if self.input_state.keyboard.key_pressed(KeyCode::Space) {
-                camera.move_up(delta_time * 2.0);
+                camera.move_up(delta_time * 30.0);
             }
             if self.input_state.keyboard.key_pressed(KeyCode::ShiftLeft) {
-                camera.move_up(-delta_time * 2.0);
+                camera.move_up(-delta_time * 30.0);
             }
 
             // Apply mouse rotation if right button is pressed
@@ -164,9 +171,15 @@ impl ApplicationHandler for Application {
                 // We can safely get a reference because we just stored it
                 let window_ref = self.window.as_ref().unwrap();
 
-                let renderer =
-                    pollster::block_on(Renderer::new_with_window(window_ref, None, None))
-                        .expect("Failed to create renderer");
+                let texture_path = &self.texture_path;
+
+                let renderer = pollster::block_on(Renderer::new_with_window(
+                    window_ref,
+                    None,
+                    texture_path.as_ref(),
+                    self.bg_color,
+                ))
+                .expect("Failed to create renderer");
 
                 self.renderer = Some(renderer);
             }
@@ -237,7 +250,9 @@ impl ApplicationHandler for Application {
                 self.input_state.keyboard.process_keyboard_event(&event);
 
                 // Handle ESC key to exit
-                if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && event.state == ElementState::Pressed {
+                if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                    && event.state == ElementState::Pressed
+                {
                     log::info!("Escape key pressed; exiting application");
                     event_loop.exit();
                 }

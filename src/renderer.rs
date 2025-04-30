@@ -3,7 +3,7 @@ use crate::mesh::{Mesh, Vertex};
 use crate::texture::Texture;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -52,6 +52,7 @@ impl Renderer {
     pub async fn new_with_window(
         window: &Window,
         aa_quality: Option<u8>,
+        texture_path: Option<&PathBuf>,
         background_color: Option<wgpu::Color>,
     ) -> Result<Self> {
         // Create instance
@@ -190,7 +191,16 @@ impl Renderer {
             });
 
         // Create default texture
-        let texture = Texture::create_default(&device, &queue);
+        let texture = match texture_path {
+            Some(path) => {
+                log::info!("Loading texture from {}", path.display());
+                Texture::load(&device, &queue, path)?
+            }
+            None => {
+                log::info!("No texture provided. Using default white texture.");
+                Texture::create_default(&device, &queue)
+            }
+        };
 
         // Create texture bind group
         let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -505,326 +515,6 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&[uniforms]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
-    }
-
-    pub fn init_readback_buffers(&mut self, face_count: usize) {
-        let output_buffer_size = u64::from(self.height) * u64::from(self.aligned_bytes_per_row);
-
-        // Create optimal device buffers (for fast GPU writes)
-        self.device_buffers = (0..face_count)
-            .map(|i| {
-                self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("Device Buffer {i}")),
-                    size: output_buffer_size,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-
-        // Create staging buffers (for CPU reads)
-        self.staging_buffers = (0..face_count)
-            .map(|i| {
-                self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("Staging Buffer {i}")),
-                    size: output_buffer_size,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-
-        // Initialize pending readbacks vector
-        self.pending_readbacks = vec![None; face_count];
-    }
-
-    pub async fn render_cube_faces(
-        &mut self,
-        mesh: &Mesh,
-        cameras: &[Camera; 6],
-    ) -> Result<Vec<Vec<u8>>> {
-        let resource_start = std::time::Instant::now();
-
-        // Ensure we have the buffers
-        if self.device_buffers.is_empty() {
-            self.init_readback_buffers(cameras.len());
-        }
-
-        // Prepare GPU resources once for all renders
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-
-        let texture_extent = wgpu::Extent3d {
-            width: self.width,
-            height: self.height,
-            depth_or_array_layers: 1,
-        };
-
-        // Create textures for all faces
-        let (render_textures, msaa_textures, depth_textures) =
-            self.create_face_textures(cameras.len());
-
-        let resource_prep_time = resource_start.elapsed();
-        let render_start = std::time::Instant::now();
-
-        // Process each face with overlapped rendering and readback
-        for (i, camera) in cameras.iter().enumerate() {
-            // Create a command encoder for this face
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some(&format!("Face {i} Encoder")),
-                });
-
-            // Create uniform buffer
-            let uniform_buffer = self.create_uniform_buffer(camera);
-
-            // Create uniform bind group for this camera
-            let uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Uniform Bind Group"),
-                layout: &self.uniform_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                }],
-            });
-
-            // Get the textures for this face
-            let texture_view =
-                render_textures[i].create_view(&wgpu::TextureViewDescriptor::default());
-            let msaa_view = msaa_textures
-                .get(i)
-                .map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default()));
-            let depth_view = depth_textures[i].create_view(&wgpu::TextureViewDescriptor::default());
-
-            // Record render pass
-            {
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(&format!("Render Pass {i}")),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: msaa_view.as_ref().unwrap_or(&texture_view),
-                        resolve_target: if self.sample_count > 1 {
-                            Some(&texture_view)
-                        } else {
-                            None
-                        },
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(self.background_color),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    occlusion_query_set: None,
-                    timestamp_writes: None,
-                });
-
-                render_pass.set_pipeline(&self.pipeline);
-                render_pass.set_bind_group(0, &uniform_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..u32::try_from(mesh.indices.len()).unwrap(), 0, 0..1);
-            }
-
-            // Copy from texture to device buffer (optimal for GPU)
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &render_textures[i],
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &self.device_buffers[i],
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(self.aligned_bytes_per_row),
-                        rows_per_image: Some(self.height),
-                    },
-                },
-                texture_extent,
-            );
-
-            // Copy from device buffer to staging buffer (optimal for CPU)
-            encoder.copy_buffer_to_buffer(
-                &self.device_buffers[i],
-                0,
-                &self.staging_buffers[i],
-                0,
-                u64::from(self.height) * u64::from(self.aligned_bytes_per_row),
-            );
-
-            // Submit commands for this face immediately
-            self.queue.submit(std::iter::once(encoder.finish()));
-
-            // Start mapping this buffer asynchronously while next face renders
-            let buffer_slice = self.staging_buffers[i].slice(..);
-
-            // Use unsafe to extend the lifetime of the buffer slice
-            // This is safe because we ensure the buffer outlives this borrow
-            let buffer_slice = unsafe {
-                std::mem::transmute::<wgpu::BufferSlice<'_>, wgpu::BufferSlice<'static>>(
-                    buffer_slice,
-                )
-            };
-
-            buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
-
-            // Store the pending readback
-            self.pending_readbacks[i] = Some(buffer_slice);
-        }
-
-        let render_time = render_start.elapsed();
-        let readback_start = std::time::Instant::now();
-
-        // Poll until all buffers are mapped
-        self.device.poll(wgpu::Maintain::Wait);
-
-        // Process the mapped data in parallel using rayon
-        let width = self.width;
-        let height = self.height;
-        let aligned_bytes_per_row = self.aligned_bytes_per_row;
-
-        let results = Arc::new(Mutex::new(vec![Vec::new(); cameras.len()]));
-
-        rayon::scope(|s| {
-            for (i, buffer_slice_opt) in self.pending_readbacks.iter_mut().enumerate() {
-                if let Some(buffer_slice) = buffer_slice_opt.take() {
-                    let results_clone = Arc::clone(&results);
-
-                    s.spawn(move |_| {
-                        // Get the buffer data
-                        let data = buffer_slice.get_mapped_range();
-                        let output_size = (width * height * 4) as usize;
-                        let mut face_data = Vec::with_capacity(output_size);
-
-                        // OPTIMIZATION #4: Efficient padding removal with unsafe
-                        unsafe {
-                            let src_ptr: *const u8 = data.as_ptr();
-                            face_data.set_len(output_size);
-                            let dest_ptr: *mut u8 = face_data.as_mut_ptr();
-
-                            for row in 0..height {
-                                std::ptr::copy_nonoverlapping(
-                                    src_ptr.add((row * aligned_bytes_per_row) as usize),
-                                    dest_ptr.add((row * width * 4) as usize),
-                                    (width * 4) as usize,
-                                );
-                            }
-                        }
-
-                        // Release the mapped range
-                        drop(data);
-
-                        // Store the result
-                        results_clone.lock().unwrap()[i] = face_data;
-                    });
-                }
-            }
-        });
-
-        // Unmap all buffers
-        for buffer in &self.staging_buffers {
-            buffer.unmap();
-        }
-
-        let readback_time = readback_start.elapsed();
-
-        // Log detailed metrics
-        log::info!("Rendering metrics:");
-        log::info!("  Resource preparation: {resource_prep_time:.2?}");
-        log::info!("  Render commands encoding: {render_time:.2?}");
-        log::info!("  GPU execution and buffer readback: {readback_time:.2?}");
-        log::info!(
-            "  Total rendering: {:.2?}",
-            resource_prep_time + render_time + readback_time
-        );
-
-        // Return the collected results
-        Ok(Arc::try_unwrap(results).unwrap().into_inner().unwrap())
-    }
-
-    // Create textures for multiple faces at once
-    fn create_face_textures(
-        &self,
-        count: usize,
-    ) -> (Vec<wgpu::Texture>, Vec<wgpu::Texture>, Vec<wgpu::Texture>) {
-        let texture_extent = wgpu::Extent3d {
-            width: self.width,
-            height: self.height,
-            depth_or_array_layers: 1,
-        };
-
-        let render_textures: Vec<_> = (0..count)
-            .map(|i| {
-                self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(&format!("Render Texture {i}")),
-                    size: texture_extent,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                })
-            })
-            .collect();
-
-        let msaa_textures: Vec<_> = if self.sample_count > 1 {
-            (0..count)
-                .map(|i| {
-                    self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some(&format!("Multisampled Texture {i}")),
-                        size: texture_extent,
-                        mip_level_count: 1,
-                        sample_count: self.sample_count,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[],
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let depth_textures: Vec<_> = (0..count)
-            .map(|i| {
-                self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(&format!("Depth Texture {i}")),
-                    size: texture_extent,
-                    mip_level_count: 1,
-                    sample_count: self.sample_count,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Depth32Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                })
-            })
-            .collect();
-
-        (render_textures, msaa_textures, depth_textures)
     }
 }
 

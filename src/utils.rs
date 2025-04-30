@@ -1,21 +1,4 @@
 use anyhow::Result;
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::Path;
-
-pub fn save_image(data: &[u8], width: u32, height: u32, path: &Path) -> Result<()> {
-    let file = File::create(path)?;
-    let writer = BufWriter::new(file);
-
-    let mut encoder = png::Encoder::new(writer, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(data)?;
-
-    Ok(())
-}
 
 pub fn parse_hex_color(hex: &str) -> Result<wgpu::Color> {
     let hex = hex.trim_start_matches('#');
