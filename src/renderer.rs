@@ -4,6 +4,7 @@ use crate::texture::Texture;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use std::path::PathBuf;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -14,19 +15,36 @@ struct Uniforms {
     model: [[f32; 4]; 4],
 }
 
+pub trait RendererTrait {
+    fn resize(&mut self, width: u32, height: u32);
+    fn load_mesh(&mut self, mesh: &Mesh);
+    fn render_to_window(&mut self, mesh: &Mesh, camera: &Camera) -> Result<()>;
+}
+
+impl<'window> RendererTrait for Renderer<'window> {
+    fn resize(&mut self, width: u32, height: u32) {
+        self.resize(width, height);
+    }
+
+    fn load_mesh(&mut self, mesh: &Mesh) {
+        self.load_mesh(mesh);
+    }
+
+    fn render_to_window(&mut self, mesh: &Mesh, camera: &Camera) -> Result<()> {
+        self.render_to_window(mesh, camera)
+    }
+}
+
 #[allow(dead_code)]
-pub struct Renderer {
-    // No lifetime parameter
+pub struct Renderer<'window> {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group: wgpu::BindGroup,
-    surface: Option<wgpu::Surface<'static>>, // Use 'static lifetime
+    surface: Option<wgpu::Surface<'window>>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
-
-    // Image rendering related fields
     width: u32,
     height: u32,
     sample_count: u32,
@@ -36,35 +54,27 @@ pub struct Renderer {
     buffer_alignment: u64,
     aligned_bytes_per_row: u32,
     pending_readbacks: Vec<Option<wgpu::BufferSlice<'static>>>,
-
-    // Mesh rendering resources
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     index_count: u32,
-
-    // MSAA and depth texture for window rendering
     msaa_texture: Option<wgpu::Texture>,
     depth_texture: Option<wgpu::Texture>,
 }
 
-impl Renderer {
-    // New constructor for window-based rendering
+impl<'window> Renderer<'window> {
     pub async fn new_with_window(
-        window: &Window,
+        window: Arc<Window>,
         aa_quality: Option<u8>,
         texture_path: Option<&PathBuf>,
         background_color: Option<wgpu::Color>,
-    ) -> Result<Self> {
+    ) -> Result<Renderer<'window>> {
         // Create instance
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let surface = unsafe {
-            let surface = instance.create_surface(window)?;
-            std::mem::transmute::<wgpu::Surface<'_>, wgpu::Surface<'static>>(surface)
-        };
+        let surface = instance.create_surface(window.clone())?;
 
         // Request adapter
         let adapter = instance

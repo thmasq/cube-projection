@@ -1,9 +1,7 @@
-// application.rs
-
 use crate::camera::Camera;
 use crate::input::InputState;
 use crate::mesh::Mesh;
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, RendererTrait};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,15 +14,15 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 pub struct Application {
     window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
+    renderer: Option<Box<dyn RendererTrait>>,
     mesh: Option<Mesh>,
     camera: Option<Camera>,
     input_state: InputState,
     last_frame_time: Instant,
     frame_count: u64,
     frame_time_accumulator: Duration,
-    texture_path: Option<PathBuf>, // Add this field
-    bg_color: Option<wgpu::Color>, // Add this field too
+    texture_path: Option<PathBuf>,
+    bg_color: Option<wgpu::Color>,
 }
 
 impl Application {
@@ -165,20 +163,23 @@ impl ApplicationHandler for Application {
                 }
 
                 // Store window
-                self.window = Some(window.into());
+                let window_arc = Arc::new(window);
+                self.window = Some(window_arc.clone());
 
                 // Now create renderer with window reference
-                // We can safely get a reference because we just stored it
-                let window_ref = self.window.as_ref().unwrap();
-
                 let texture_path = &self.texture_path;
 
-                let renderer = pollster::block_on(Renderer::new_with_window(
-                    window_ref,
-                    None,
-                    texture_path.as_ref(),
-                    self.bg_color,
-                ))
+                let renderer = pollster::block_on(async {
+                    let renderer = Renderer::new_with_window(
+                        self.window.as_ref().unwrap().clone(),
+                        None,
+                        texture_path.as_ref(),
+                        self.bg_color,
+                    )
+                    .await?;
+
+                    Ok::<Box<dyn RendererTrait>, anyhow::Error>(Box::new(renderer))
+                })
                 .expect("Failed to create renderer");
 
                 self.renderer = Some(renderer);
@@ -233,7 +234,7 @@ impl ApplicationHandler for Application {
                 // 1) borrow window immutably, then end that borrow immediately
                 if let Some(window) = &self.window {
                     window.pre_present_notify();
-                } // ← borrow of `&self.window` ends here
+                } // ← borrow of &self.window ends here
 
                 // 2) now that no immutable borrow is active, call render()
                 if let Err(err) = self.render() {
